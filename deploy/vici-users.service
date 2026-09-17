@@ -1,13 +1,15 @@
 [Unit]
 Description=Vici-Users API - EHECTO
-After=network.target mariadb.service
-Wants=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/vici-users
 Environment=ASTGUI_CONF=/etc/astguiclient.conf
+Environment=VICI_DB_HOST=172.20.20.198
+Environment=VICI_DB_EXPECTED_HOST=172.20.20.198
 Environment=VICI_USERS_ENABLE_CREATE=false
 ExecStart=/opt/vici-users/.venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8094
 Restart=on-failure
