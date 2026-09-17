@@ -1,3 +1,5 @@
-fastapi==0.116.1
-uvicorn[standard]==0.35.0
-PyMySQL==1.1.2
+fastapi==0.83.0
+uvicorn==0.16.0
+pydantic==1.9.2
+starlette==0.19.1
+PyMySQL==1.0.2
