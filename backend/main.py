@@ -1,12 +1,10 @@
-from __future__ import annotations
-
 import os
 import re
 import socket
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Set
 
 import pymysql
 from fastapi import FastAPI, HTTPException
@@ -19,11 +17,12 @@ EXPECTED_DB_HOST = os.getenv("VICI_DB_EXPECTED_HOST", "172.20.20.198")
 CREATE_ENABLED = os.getenv("VICI_USERS_ENABLE_CREATE", "false").lower() in {"1", "true", "yes", "y"}
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
 
-app = FastAPI(title="Vici-Users API", version="0.2.1")
+app = FastAPI(title="Vici-Users API", version="0.2.2-py36")
 
 
-def _read_astguiclient_conf() -> dict[str, str]:
-    values: dict[str, str] = {}
+def _read_astguiclient_conf():
+    # type: () -> Dict[str, str]
+    values = {}
     if not ASTGUI_CONF.exists():
         return values
 
@@ -45,7 +44,7 @@ def _read_astguiclient_conf() -> dict[str, str]:
     return values
 
 
-def db_config() -> dict:
+def db_config():
     conf = _read_astguiclient_conf()
     host = os.getenv("VICI_DB_HOST", conf.get("host", EXPECTED_DB_HOST))
     database = os.getenv("VICI_DB_NAME", conf.get("database", "asterisk"))
@@ -56,7 +55,10 @@ def db_config() -> dict:
     if EXPECTED_DB_HOST and host != EXPECTED_DB_HOST:
         raise HTTPException(
             status_code=503,
-            detail=f"DB host rechazado por seguridad: {host}. EHECTO espera vici222 ({EXPECTED_DB_HOST}).",
+            detail="DB host rechazado por seguridad: %s. EHECTO espera vici222 (%s)." % (
+                host,
+                EXPECTED_DB_HOST,
+            ),
         )
 
     return {
@@ -84,58 +86,62 @@ def db_cursor():
     except HTTPException:
         raise
     except pymysql.MySQLError as exc:
-        raise HTTPException(status_code=503, detail=f"No fue posible consultar VICIdial DB en vici222: {exc}") from exc
+        raise HTTPException(
+            status_code=503,
+            detail="No fue posible consultar VICIdial DB en vici222: %s" % exc,
+        )
     finally:
         if connection:
             connection.close()
 
 
-def normalize_token(value: str) -> str:
+def normalize_token(value):
     text = unicodedata.normalize("NFD", value or "")
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     text = text.replace("Ñ", "N").replace("ñ", "n")
     return re.sub(r"[^A-Za-z0-9]", "", text).upper()
 
 
-def first_name(value: str) -> str:
+def first_name(value):
     parts = (value or "").strip().split()
     return normalize_token(parts[0]) if parts else ""
 
 
-def candidate_for(last_name: str, name: str, prefix_len: int) -> str:
-    raw = f"{last_name[:prefix_len]}{name}"
+def candidate_for(last_name, name, prefix_len):
+    raw = "%s%s" % (last_name[:prefix_len], name)
     return raw[:USERNAME_MAX_LENGTH]
 
 
 class PersonIn(BaseModel):
-    first_names: str = Field(min_length=1, max_length=120)
-    paternal: str = Field(min_length=1, max_length=80)
-    maternal: str = Field(default="", max_length=80)
+    first_names: str = Field(..., min_length=1, max_length=120)
+    paternal: str = Field(..., min_length=1, max_length=80)
+    maternal: str = Field("", max_length=80)
 
 
 class PreviewRequest(BaseModel):
-    template_user: str = Field(min_length=1, max_length=20)
-    user_group: str = Field(min_length=1, max_length=20)
-    people: list[PersonIn] = Field(min_length=1, max_length=500)
+    template_user: str = Field(..., min_length=1, max_length=20)
+    user_group: str = Field(..., min_length=1, max_length=20)
+    people: List[PersonIn] = Field(..., min_items=1, max_items=500)
 
 
 class CreateRequest(PreviewRequest):
-    usernames: list[str] = Field(min_length=1, max_length=500)
+    usernames: List[str] = Field(..., min_items=1, max_items=500)
 
 
 @app.get("/api/health")
 def health():
     db_ok = False
     db_host = EXPECTED_DB_HOST
+    row = {"db_node": None, "db_name": None}
+
     try:
         cfg = db_config()
         db_host = cfg["host"]
         with db_cursor() as cursor:
             cursor.execute("SELECT @@hostname AS db_node, DATABASE() AS db_name, 1 AS ok")
-            row = cursor.fetchone()
-            db_ok = row["ok"] == 1
+            row = cursor.fetchone() or row
+            db_ok = row.get("ok") == 1
     except HTTPException:
-        row = {"db_node": None, "db_name": None}
         db_ok = False
 
     return {
@@ -145,11 +151,12 @@ def health():
         "db_role": "vici222 / DataBase Only",
         "db_host": db_host,
         "expected_db_host": EXPECTED_DB_HOST,
-        "db_node": row.get("db_node") if row else None,
-        "db_name": row.get("db_name") if row else None,
+        "db_node": row.get("db_node"),
+        "db_name": row.get("db_name"),
         "db_ok": db_ok,
         "create_enabled": CREATE_ENABLED,
         "username_max_length": USERNAME_MAX_LENGTH,
+        "python_compat": "3.6+",
     }
 
 
@@ -169,7 +176,7 @@ def groups():
 
 
 @app.get("/api/groups/{user_group}/users")
-def group_users(user_group: str):
+def group_users(user_group):
     with db_cursor() as cursor:
         cursor.execute(
             """
@@ -185,7 +192,7 @@ def group_users(user_group: str):
 
 
 @app.get("/api/users/{user}")
-def user_detail(user: str):
+def user_detail(user):
     with db_cursor() as cursor:
         cursor.execute(
             """
@@ -215,12 +222,15 @@ def preview_users(payload: PreviewRequest):
         if not template:
             raise HTTPException(status_code=404, detail="Usuario plantilla no encontrado")
         if template["user_group"] != payload.user_group:
-            raise HTTPException(status_code=400, detail="El usuario plantilla no pertenece al User Group seleccionado")
+            raise HTTPException(
+                status_code=400,
+                detail="El usuario plantilla no pertenece al User Group seleccionado",
+            )
 
         cursor.execute("SELECT user FROM vicidial_users")
-        existing = {str(row["user"]).upper() for row in cursor.fetchall()}
+        existing = set(str(row["user"]).upper() for row in cursor.fetchall())
 
-    reserved: set[str] = set()
+    reserved = set()  # type: Set[str]
     results = []
 
     for index, person in enumerate(payload.people, start=1):
@@ -242,8 +252,9 @@ def preview_users(payload: PreviewRequest):
             })
             continue
 
-        chosen: Optional[str] = None
-        attempts: list[str] = []
+        chosen = None  # type: Optional[str]
+        attempts = []  # type: List[str]
+
         for prefix_len in range(1, len(last) + 1):
             candidate = candidate_for(last, name, prefix_len)
             if candidate in attempts:
@@ -258,7 +269,10 @@ def preview_users(payload: PreviewRequest):
             suffix = 2
             while suffix < 10000:
                 suffix_text = str(suffix)
-                candidate = f"{base[:USERNAME_MAX_LENGTH-len(suffix_text)]}{suffix_text}"
+                candidate = "%s%s" % (
+                    base[:USERNAME_MAX_LENGTH - len(suffix_text)],
+                    suffix_text,
+                )
                 if candidate not in existing and candidate not in reserved:
                     chosen = candidate
                     break
@@ -307,10 +321,16 @@ def create_users(payload: CreateRequest):
     if not CREATE_ENABLED:
         raise HTTPException(
             status_code=403,
-            detail="Creación deshabilitada. CP1 sólo consulta vici222; habilite escritura únicamente después de validar el método de provisión.",
+            detail=(
+                "Creación deshabilitada. CP1 sólo consulta vici222; "
+                "habilite escritura únicamente después de validar el método de provisión."
+            ),
         )
 
-    raise HTTPException(status_code=501, detail="CP1 conectado. Motor de creación pendiente de CP2.")
+    raise HTTPException(
+        status_code=501,
+        detail="CP1 conectado. Motor de creación pendiente de CP2.",
+    )
 
 
 @app.get("/")
@@ -318,4 +338,4 @@ def index():
     index_file = APP_ROOT / "index.html"
     if not index_file.exists():
         raise HTTPException(status_code=404, detail="index.html no encontrado")
-    return FileResponse(index_file)
+    return FileResponse(str(index_file))
