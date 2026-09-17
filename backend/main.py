@@ -15,10 +15,11 @@ from pydantic import BaseModel, Field
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 ASTGUI_CONF = Path(os.getenv("ASTGUI_CONF", "/etc/astguiclient.conf"))
+EXPECTED_DB_HOST = os.getenv("VICI_DB_EXPECTED_HOST", "172.20.20.198")
 CREATE_ENABLED = os.getenv("VICI_USERS_ENABLE_CREATE", "false").lower() in {"1", "true", "yes", "y"}
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
 
-app = FastAPI(title="Vici-Users API", version="0.2.0")
+app = FastAPI(title="Vici-Users API", version="0.2.1")
 
 
 def _read_astguiclient_conf() -> dict[str, str]:
@@ -46,11 +47,17 @@ def _read_astguiclient_conf() -> dict[str, str]:
 
 def db_config() -> dict:
     conf = _read_astguiclient_conf()
-    host = os.getenv("VICI_DB_HOST", conf.get("host", "127.0.0.1"))
+    host = os.getenv("VICI_DB_HOST", conf.get("host", EXPECTED_DB_HOST))
     database = os.getenv("VICI_DB_NAME", conf.get("database", "asterisk"))
     user = os.getenv("VICI_DB_USER", conf.get("user", "cron"))
     password = os.getenv("VICI_DB_PASS", conf.get("password", ""))
     port = int(os.getenv("VICI_DB_PORT", conf.get("port", "3306") or "3306"))
+
+    if EXPECTED_DB_HOST and host != EXPECTED_DB_HOST:
+        raise HTTPException(
+            status_code=503,
+            detail=f"DB host rechazado por seguridad: {host}. EHECTO espera vici222 ({EXPECTED_DB_HOST}).",
+        )
 
     return {
         "host": host,
@@ -74,8 +81,10 @@ def db_cursor():
         connection = pymysql.connect(**db_config())
         with connection.cursor() as cursor:
             yield cursor
+    except HTTPException:
+        raise
     except pymysql.MySQLError as exc:
-        raise HTTPException(status_code=503, detail=f"No fue posible consultar VICIdial DB: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"No fue posible consultar VICIdial DB en vici222: {exc}") from exc
     finally:
         if connection:
             connection.close()
@@ -117,19 +126,27 @@ class CreateRequest(PreviewRequest):
 @app.get("/api/health")
 def health():
     db_ok = False
-    db_host = db_config()["host"]
+    db_host = EXPECTED_DB_HOST
     try:
+        cfg = db_config()
+        db_host = cfg["host"]
         with db_cursor() as cursor:
-            cursor.execute("SELECT 1 AS ok")
-            db_ok = cursor.fetchone()["ok"] == 1
+            cursor.execute("SELECT @@hostname AS db_node, DATABASE() AS db_name, 1 AS ok")
+            row = cursor.fetchone()
+            db_ok = row["ok"] == 1
     except HTTPException:
+        row = {"db_node": None, "db_name": None}
         db_ok = False
 
     return {
         "status": "ok" if db_ok else "degraded",
-        "node": socket.gethostname(),
+        "app_node": socket.gethostname(),
         "target": "EHECTO",
+        "db_role": "vici222 / DataBase Only",
         "db_host": db_host,
+        "expected_db_host": EXPECTED_DB_HOST,
+        "db_node": row.get("db_node") if row else None,
+        "db_name": row.get("db_name") if row else None,
         "db_ok": db_ok,
         "create_enabled": CREATE_ENABLED,
         "username_max_length": USERNAME_MAX_LENGTH,
@@ -290,13 +307,10 @@ def create_users(payload: CreateRequest):
     if not CREATE_ENABLED:
         raise HTTPException(
             status_code=403,
-            detail="Creación deshabilitada. Validación/preview están activos; habilite VICI_USERS_ENABLE_CREATE cuando el método de provisión haya sido aprobado.",
+            detail="Creación deshabilitada. CP1 sólo consulta vici222; habilite escritura únicamente después de validar el método de provisión.",
         )
 
-    # Protección intencional: CP1 conecta lectura y preview contra datos reales.
-    # La escritura se implementará en el siguiente checkpoint usando el método
-    # de provisión VICIdial acordado (API + clonación controlada de plantilla).
-    raise HTTPException(status_code=501, detail="CP1 conectado. Motor de creación pendiente de habilitar en CP2.")
+    raise HTTPException(status_code=501, detail="CP1 conectado. Motor de creación pendiente de CP2.")
 
 
 @app.get("/")
