@@ -21,7 +21,7 @@
 
   <main class="main">
     <header class="top">
-      <div><div class="eyebrow">EHECTO · ADMINISTRACIÓN</div><h1>Alta masiva de usuarios</h1><div class="sub">Cada User Group utiliza un único usuario plantilla autorizado por el backend.</div></div>
+      <div><div class="eyebrow">EHECTO · ADMINISTRACIÓN</div><h1>Alta masiva de usuarios</h1><div class="sub">Cada User Group utiliza un usuario base y una contraseña default protegidos en vici97.</div></div>
       <div class="status-pill"><span id="topDot" class="dot"></span><strong id="connectionText">Conectando…</strong></div>
     </header>
 
@@ -34,21 +34,23 @@
 
     <section class="layout">
       <div class="card">
-        <div class="head"><div><h2>Configuración del lote</h2><p>Grupo, plantilla fija y password del lote.</p></div><span class="step">Paso 1</span></div>
+        <div class="head"><div><h2>Configuración del lote</h2><p>Grupo, plantilla fija y password default.</p></div><span class="step">Paso 1</span></div>
         <div class="body">
           <div id="connectionError" class="conn-error hidden"></div>
-          <div class="field"><label>User Group</label><select id="userGroup" disabled><option>Cargando…</option></select><div class="hint">Cada grupo debe tener exactamente un usuario base configurado en vici97.</div></div>
+          <div class="field"><label>User Group</label><select id="userGroup" disabled><option>Cargando…</option></select><div class="hint">El backend sólo muestra grupos administrados cuando existe configuración local.</div></div>
           <div id="templateWarning" class="template-warning hidden"></div>
           <div class="template">
             <div><span>Usuario base</span><strong id="tplUser">—</strong></div>
             <div><span>User level</span><strong id="tplLevel">—</strong></div>
             <div><span>Grupo</span><strong id="tplGroup">—</strong></div>
             <div><span>Nombre</span><strong id="tplName">—</strong></div>
+            <div><span>Password default</span><strong id="passDefaultStatus">—</strong></div>
+            <div><span>Secreto almacenado</span><strong>vici97</strong></div>
           </div>
           <div class="field">
-            <label>Contraseña para los nuevos usuarios</label>
-            <div class="password-box"><input id="agentPass" type="password" autocomplete="new-password" placeholder="Indicar según el caso" /><button id="togglePass" type="button">Mostrar</button></div>
-            <div class="hint">No se hereda de la plantilla. No se envía durante el preview y no se guarda en GitHub.</div>
+            <label>Override de contraseña <span style="font-weight:500;color:#64748b">(opcional)</span></label>
+            <div class="password-box"><input id="agentPass" type="password" autocomplete="new-password" placeholder="Vacío = usar password default del grupo" /><button id="togglePass" type="button">Mostrar</button></div>
+            <div class="hint">Si queda vacío, el backend usará el default del grupo. El valor default nunca se envía al navegador ni se almacena en GitHub.</div>
           </div>
           <div class="field"><label>Personas</label><textarea id="bulkText" placeholder="Juan Carlos,Pérez,López&#10;María Fernanda,Hernández,Soto&#10;Luis,Gómez,Ruiz"></textarea><div class="hint">Una persona por línea: <strong>Nombre(s), Apellido paterno, Apellido materno</strong>.</div></div>
           <div class="rule"><strong>Regla EHECTO</strong><br>Primera letra del apellido paterno + primer nombre. Si existe, amplía el apellido: <code>PJUAN → PEJUAN → PERJUAN…</code>.</div>
@@ -82,7 +84,7 @@
   function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').classList.remove('show'),3200)}
   async function api(path, options={}){const response=await fetch(API+path,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);return data}
   function setConnection(ok,text){$('serverDot').className='dot '+(ok?'ok':'bad');$('topDot').className='dot '+(ok?'ok':'bad');$('connectionText').textContent=text;$('serverText').textContent=ok?'API vici97 activa y vici222 accesible.':'Sin conexión con backend o DB central.'}
-  function resetTemplate(group='—'){$('tplUser').textContent='—';$('tplLevel').textContent='—';$('tplGroup').textContent=group||'—';$('tplName').textContent='—';selectedTemplate=null;$('previewBtn').disabled=true}
+  function resetTemplate(group='—'){$('tplUser').textContent='—';$('tplLevel').textContent='—';$('tplGroup').textContent=group||'—';$('tplName').textContent='—';$('passDefaultStatus').textContent='—';selectedTemplate=null;$('previewBtn').disabled=true}
 
   async function boot(){
     try{
@@ -93,13 +95,16 @@
 
   async function loadGroups(){
     const data=await api('/groups');const select=$('userGroup');
-    select.innerHTML='<option value="">Selecciona un User Group</option>'+data.groups.map(g=>`<option value="${escapeHtml(g.user_group)}">${escapeHtml(g.user_group)}${g.group_name?' · '+escapeHtml(g.group_name):''}${g.template_configured?'':' · SIN PLANTILLA'}</option>`).join('');select.disabled=false;
+    select.innerHTML='<option value="">Selecciona un User Group</option>'+data.groups.map(g=>{
+      const flags=[];if(!g.template_configured)flags.push('SIN PLANTILLA');if(!g.default_password_configured)flags.push('SIN PASSWORD DEFAULT');
+      return `<option value="${escapeHtml(g.user_group)}">${escapeHtml(g.user_group)}${g.group_name?' · '+escapeHtml(g.group_name):''}${flags.length?' · '+flags.join(' / '):''}</option>`
+    }).join('');select.disabled=false;
   }
 
   async function loadTemplate(){
     const group=$('userGroup').value;resetTemplate(group);$('templateWarning').classList.add('hidden');if(!group)return;
     try{
-      const data=await api(`/groups/${encodeURIComponent(group)}/template`);
+      const data=await api(`/groups/${encodeURIComponent(group)}/template`);$('passDefaultStatus').textContent=data.default_password_configured?'Configurado':'No configurado';
       if(!data.configured){$('templateWarning').textContent=`El grupo ${group} todavía no tiene usuario base configurado en vici97.`;$('templateWarning').classList.remove('hidden');return}
       selectedTemplate=data.template;$('tplUser').textContent=selectedTemplate.user;$('tplLevel').textContent=selectedTemplate.user_level;$('tplGroup').textContent=selectedTemplate.user_group;$('tplName').textContent=selectedTemplate.full_name||'—';$('previewBtn').disabled=false;
     }catch(error){$('templateWarning').textContent=error.message;$('templateWarning').classList.remove('hidden');toast(error.message)}
@@ -110,7 +115,7 @@
   async function validateBatch(){
     const people=peopleFromText(),group=$('userGroup').value;if(!group||!selectedTemplate){toast('Selecciona un User Group que tenga usuario base configurado.');return}if(!people.length){toast('Agrega al menos una persona.');return}
     $('previewBtn').disabled=true;$('previewBtn').textContent='Validando…';
-    try{previewPayload=await api('/users/preview',{method:'POST',body:JSON.stringify({user_group:group,people})});renderPreview(previewPayload);toast(`Validación completada: ${previewPayload.available} usuario(s) disponibles.`)}catch(error){toast(error.message)}finally{$('previewBtn').disabled=false;$('previewBtn').textContent='Previsualizar y validar'}
+    try{previewPayload=await api('/users/preview',{method:'POST',body:JSON.stringify({user_group:group,people})});$('passDefaultStatus').textContent=previewPayload.default_password_configured?'Configurado':'No configurado';renderPreview(previewPayload);toast(`Validación completada: ${previewPayload.available} usuario(s) disponibles.`)}catch(error){toast(error.message)}finally{$('previewBtn').disabled=false;$('previewBtn').textContent='Previsualizar y validar'}
   }
 
   function renderPreview(data){
@@ -121,7 +126,7 @@
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
   $('togglePass').addEventListener('click',()=>{const f=$('agentPass');const show=f.type==='password';f.type=show?'text':'password';$('togglePass').textContent=show?'Ocultar':'Mostrar'});
   $('demoBtn').addEventListener('click',()=>{$('bulkText').value='Juan Carlos,Pérez,López\nMaría Fernanda,Hernández,Ruiz\nKristian Michell,Maya,Guzmán\nJosé Luis,Hernández,Soto';toast('Ejemplo cargado. Selecciona un grupo con plantilla configurada.')});
-  $('createBtn').addEventListener('click',()=>{if(!$('agentPass').value){toast('Indica el password que corresponde a este lote.');return}toast('La escritura continúa protegida en CP1. El password no fue enviado ni guardado.')});
+  $('createBtn').addEventListener('click',()=>{const override=$('agentPass').value;toast(override?'Se usaría el override indicado para este lote. CP1 aún no escribe.':'Se usaría el password default del grupo. CP1 aún no escribe.')});
   boot();
 </script>
 </body>
