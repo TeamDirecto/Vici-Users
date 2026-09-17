@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Set
 
 import pymysql
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -16,8 +17,23 @@ ASTGUI_CONF = Path(os.getenv("ASTGUI_CONF", "/etc/astguiclient.conf"))
 EXPECTED_DB_HOST = os.getenv("VICI_DB_EXPECTED_HOST", "172.20.20.198")
 CREATE_ENABLED = os.getenv("VICI_USERS_ENABLE_CREATE", "false").lower() in {"1", "true", "yes", "y"}
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "VICI_USERS_CORS_ORIGINS",
+        "https://teamdirecto.github.io",
+    ).split(",")
+    if origin.strip()
+]
 
-app = FastAPI(title="Vici-Users API", version="0.2.2-py36")
+app = FastAPI(title="Vici-Users API", version="0.3.0-pages")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 
 def _read_astguiclient_conf():
@@ -157,6 +173,7 @@ def health():
         "create_enabled": CREATE_ENABLED,
         "username_max_length": USERNAME_MAX_LENGTH,
         "python_compat": "3.6+",
+        "cors_origins": CORS_ORIGINS,
     }
 
 
