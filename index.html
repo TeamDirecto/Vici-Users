@@ -16,7 +16,7 @@
   <aside class="sidebar">
     <div class="brand"><div class="mark">VU</div><div><strong>Vici-Users</strong><small>Provisioning Console</small></div></div>
     <div><div class="nav-title">EHECTO</div><div class="nav">＋ Alta de usuarios</div></div>
-    <div class="server"><div><span id="serverDot" class="dot"></span><strong>vici97</strong></div><p id="serverText">Comprobando API y base VICIdial…</p></div>
+    <div class="server"><div><span id="serverDot" class="dot"></span><strong>vici97</strong></div><p id="serverText">Comprobando API en vici97 y base vici222…</p></div>
   </aside>
 
   <main class="main">
@@ -34,12 +34,12 @@
 
     <section class="layout">
       <div class="card">
-        <div class="head"><div><h2>Configuración del lote</h2><p>Datos obtenidos desde VICIdial.</p></div><span class="step">Paso 1</span></div>
+        <div class="head"><div><h2>Configuración del lote</h2><p>Datos obtenidos desde la DB central de EHECTO.</p></div><span class="step">Paso 1</span></div>
         <div class="body">
           <div id="connectionError" class="conn-error hidden"></div>
-          <div class="field"><label>User Group</label><select id="userGroup" disabled><option>Cargando…</option></select><div class="hint">Se consulta desde <code>vicidial_user_groups</code> a través del backend en vici97.</div></div>
+          <div class="field"><label>User Group</label><select id="userGroup" disabled><option>Cargando…</option></select><div class="hint">vici97 ejecuta la API; los datos se consultan en <strong>vici222 / 172.20.20.198</strong>.</div></div>
           <div class="field"><label>Usuario plantilla</label><select id="templateUser" disabled><option>Selecciona un grupo</option></select></div>
-          <div class="template"><div><span>User level</span><strong id="tplLevel">—</strong></div><div><span>Grupo</span><strong id="tplGroup">—</strong></div><div><span>Nombre</span><strong id="tplName">—</strong></div><div><span>Origen</span><strong>vici97</strong></div></div>
+          <div class="template"><div><span>User level</span><strong id="tplLevel">—</strong></div><div><span>Grupo</span><strong id="tplGroup">—</strong></div><div><span>Nombre</span><strong id="tplName">—</strong></div><div><span>Base</span><strong>vici222</strong></div></div>
           <div class="field"><label>Personas</label><textarea id="bulkText" placeholder="Juan Carlos,Pérez,López&#10;María Fernanda,Hernández,Soto&#10;Luis,Gómez,Ruiz"></textarea><div class="hint">Una persona por línea: <strong>Nombre(s), Apellido paterno, Apellido materno</strong>.</div></div>
           <div class="rule"><strong>Regla EHECTO</strong><br>Primera letra del apellido paterno + primer nombre. Si existe, amplía el apellido: <code>PJUAN → PEJUAN → PERJUAN…</code>.</div>
           <div class="btns"><button class="btn primary" id="previewBtn" disabled>Previsualizar y validar</button><button class="btn secondary" id="demoBtn">Cargar ejemplo</button></div>
@@ -47,12 +47,12 @@
       </div>
 
       <div class="card">
-        <div class="head"><div><h2>Previsualización</h2><p>Resultado devuelto por vici97 antes de cualquier alta.</p></div><span class="step">Paso 2</span></div>
+        <div class="head"><div><h2>Previsualización</h2><p>Resultado calculado por vici97 consultando vici222 antes de cualquier alta.</p></div><span class="step">Paso 2</span></div>
         <div id="empty" class="empty"><strong>Aún no hay usuarios para revisar</strong><p>Selecciona plantilla, captura personas y valida el lote.</p></div>
         <div id="preview" class="hidden">
           <div class="toolbar"><strong id="previewSummary">0 registros</strong><span id="templateBadge" class="badge gray">Plantilla —</span></div>
           <div class="table-wrap"><table><thead><tr><th>Persona</th><th>Inicial</th><th>Username final</th><th>Resultado</th><th>Intentos</th></tr></thead><tbody id="rows"></tbody></table></div>
-          <div class="footer"><small id="createNote">CP1: consulta y preview real. Escritura protegida.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuarios</button></div></div>
+          <div class="footer"><small id="createNote">CP1: consulta real en vici222. Escritura protegida.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuarios</button></div></div>
         </div>
       </div>
     </section>
@@ -77,18 +77,18 @@
 
   function setConnection(ok, text){
     $('serverDot').className='dot '+(ok?'ok':'bad');$('topDot').className='dot '+(ok?'ok':'bad');$('connectionText').textContent=text;
-    $('serverText').textContent=ok?'API activa y conexión VICIdial disponible.':'Sin conexión con backend/DB de VICIdial.';
+    $('serverText').textContent=ok?'API vici97 activa y vici222 accesible.':'Sin conexión con backend o DB central.';
   }
 
   async function boot(){
     try{
       apiHealth = await api('/health');
-      if(!apiHealth.db_ok) throw new Error('Backend activo, pero no hay conexión con la DB VICIdial.');
-      setConnection(true, `${apiHealth.node} · conectado`);
+      if(!apiHealth.db_ok) throw new Error('Backend activo, pero no hay conexión con vici222.');
+      setConnection(true, `${apiHealth.app_node} → ${apiHealth.db_node || 'vici222'} · conectado`);
       $('connectionError').classList.add('hidden');
       await loadGroups();
       $('createBtn').disabled = !apiHealth.create_enabled;
-      $('createNote').textContent = apiHealth.create_enabled ? 'Modo creación habilitado en backend.' : 'CP1: consulta y preview real. Escritura protegida por VICI_USERS_ENABLE_CREATE=false.';
+      $('createNote').textContent = apiHealth.create_enabled ? 'Modo creación habilitado en backend.' : 'CP1: lectura y preview real contra vici222; escritura deshabilitada.';
     }catch(error){
       setConnection(false,'Sin conexión');
       $('connectionError').textContent=error.message;$('connectionError').classList.remove('hidden');
@@ -152,8 +152,8 @@
   $('templateUser').addEventListener('change',loadTemplateDetail);
   $('previewBtn').addEventListener('click',validateBatch);
   $('revalidateBtn').addEventListener('click',validateBatch);
-  $('demoBtn').addEventListener('click',()=>{$('bulkText').value='Juan Carlos,Pérez,López\nMaría Fernanda,Hernández,Ruiz\nKristian Michell,Maya,Guzmán\nJosé Luis,Hernández,Soto';toast('Ejemplo cargado. Selecciona grupo y plantilla para validar contra datos reales.')});
-  $('createBtn').addEventListener('click',async()=>{if(!previewPayload)return;toast('La escritura permanece protegida en CP1; habilitaremos el motor de provisión en CP2.')});
+  $('demoBtn').addEventListener('click',()=>{$('bulkText').value='Juan Carlos,Pérez,López\nMaría Fernanda,Hernández,Ruiz\nKristian Michell,Maya,Guzmán\nJosé Luis,Hernández,Soto';toast('Ejemplo cargado. Selecciona grupo y plantilla para validar contra vici222.')});
+  $('createBtn').addEventListener('click',()=>{toast('La escritura permanece protegida en CP1; habilitaremos el motor de provisión en CP2.')});
 
   boot();
 </script>
