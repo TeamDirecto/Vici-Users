@@ -7,13 +7,12 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/opt/vici-users
-Environment=ASTGUI_CONF=/etc/astguiclient.conf
-Environment=VICI_DB_HOST=172.20.20.198
-Environment=VICI_DB_EXPECTED_HOST=172.20.20.198
-Environment=VICI_USERS_ENABLE_CREATE=false
-ExecStart=/opt/vici-users/.venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8094
+EnvironmentFile=-/etc/sysconfig/vici-users
+ExecStart=/opt/vici-users/.venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8094
 Restart=on-failure
 RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
