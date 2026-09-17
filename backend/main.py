@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import socket
@@ -17,6 +18,9 @@ ASTGUI_CONF = Path(os.getenv("ASTGUI_CONF", "/etc/astguiclient.conf"))
 EXPECTED_DB_HOST = os.getenv("VICI_DB_EXPECTED_HOST", "172.20.20.198")
 CREATE_ENABLED = os.getenv("VICI_USERS_ENABLE_CREATE", "false").lower() in {"1", "true", "yes", "y"}
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
+GROUP_TEMPLATES_FILE = Path(
+    os.getenv("VICI_USERS_GROUP_TEMPLATES_FILE", "/etc/vici-users/group_templates.json")
+)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -26,7 +30,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.3.0-pages")
+app = FastAPI(title="Vici-Users API", version="0.4.0-group-template")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -58,6 +62,34 @@ def _read_astguiclient_conf():
         if key in wanted:
             values[wanted[key]] = value
     return values
+
+
+def load_group_templates():
+    # type: () -> Dict[str, str]
+    if not GROUP_TEMPLATES_FILE.exists():
+        return {}
+    try:
+        with GROUP_TEMPLATES_FILE.open("r") as fh:
+            data = json.load(fh)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Configuración de plantillas inválida: %s" % exc,
+        )
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=503,
+            detail="group_templates.json debe contener un objeto JSON user_group -> template_user",
+        )
+
+    clean = {}
+    for group, user in data.items():
+        group = str(group).strip()
+        user = str(user).strip()
+        if group and user:
+            clean[group] = user
+    return clean
 
 
 def db_config():
@@ -128,6 +160,29 @@ def candidate_for(last_name, name, prefix_len):
     return raw[:USERNAME_MAX_LENGTH]
 
 
+def get_group_template(user_group):
+    templates = load_group_templates()
+    template_user = templates.get(user_group)
+    if not template_user:
+        return None
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user, full_name, user_level, user_group, active,
+                   hotkeys_active, agent_choose_ingroups, agent_choose_blended,
+                   scheduled_callbacks, agentonly_callbacks
+              FROM vicidial_users
+             WHERE user=%s
+               AND user_group=%s
+               AND active='Y'
+             LIMIT 1
+            """,
+            (template_user, user_group),
+        )
+        return cursor.fetchone()
+
+
 class PersonIn(BaseModel):
     first_names: str = Field(..., min_length=1, max_length=120)
     paternal: str = Field(..., min_length=1, max_length=80)
@@ -135,13 +190,13 @@ class PersonIn(BaseModel):
 
 
 class PreviewRequest(BaseModel):
-    template_user: str = Field(..., min_length=1, max_length=20)
     user_group: str = Field(..., min_length=1, max_length=20)
     people: List[PersonIn] = Field(..., min_items=1, max_items=500)
 
 
 class CreateRequest(PreviewRequest):
     usernames: List[str] = Field(..., min_items=1, max_items=500)
+    agent_pass: str = Field(..., min_length=1, max_length=100)
 
 
 @app.get("/api/health")
@@ -160,6 +215,13 @@ def health():
     except HTTPException:
         db_ok = False
 
+    try:
+        template_count = len(load_group_templates())
+        templates_ok = True
+    except HTTPException:
+        template_count = 0
+        templates_ok = False
+
     return {
         "status": "ok" if db_ok else "degraded",
         "app_node": socket.gethostname(),
@@ -174,11 +236,15 @@ def health():
         "username_max_length": USERNAME_MAX_LENGTH,
         "python_compat": "3.6+",
         "cors_origins": CORS_ORIGINS,
+        "group_templates_file": str(GROUP_TEMPLATES_FILE),
+        "group_templates_ok": templates_ok,
+        "group_templates_count": template_count,
     }
 
 
 @app.get("/api/groups")
 def groups():
+    templates = load_group_templates()
     with db_cursor() as cursor:
         cursor.execute(
             """
@@ -189,11 +255,45 @@ def groups():
              ORDER BY user_group
             """
         )
-        return {"groups": cursor.fetchall()}
+        rows = cursor.fetchall()
+
+    for row in rows:
+        row["template_configured"] = row["user_group"] in templates
+        row["template_user"] = templates.get(row["user_group"])
+    return {"groups": rows}
+
+
+@app.get("/api/groups/{user_group}/template")
+def group_template(user_group):
+    templates = load_group_templates()
+    configured_user = templates.get(user_group)
+    if not configured_user:
+        return {
+            "user_group": user_group,
+            "configured": False,
+            "template": None,
+        }
+
+    template = get_group_template(user_group)
+    if not template:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "La plantilla configurada %s no existe, está inactiva o no pertenece al grupo %s"
+                % (configured_user, user_group)
+            ),
+        )
+
+    return {
+        "user_group": user_group,
+        "configured": True,
+        "template": template,
+    }
 
 
 @app.get("/api/groups/{user_group}/users")
 def group_users(user_group):
+    # Endpoint de diagnóstico/configuración. El front operativo no lo usa.
     with db_cursor() as cursor:
         cursor.execute(
             """
@@ -224,26 +324,20 @@ def user_detail(user):
         )
         row = cursor.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Usuario plantilla no encontrado")
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
         return row
 
 
 @app.post("/api/users/preview")
 def preview_users(payload: PreviewRequest):
-    with db_cursor() as cursor:
-        cursor.execute(
-            "SELECT user, user_group, user_level, active FROM vicidial_users WHERE user=%s LIMIT 1",
-            (payload.template_user,),
+    template = get_group_template(payload.user_group)
+    if not template:
+        raise HTTPException(
+            status_code=409,
+            detail="El User Group %s no tiene un usuario plantilla configurado" % payload.user_group,
         )
-        template = cursor.fetchone()
-        if not template:
-            raise HTTPException(status_code=404, detail="Usuario plantilla no encontrado")
-        if template["user_group"] != payload.user_group:
-            raise HTTPException(
-                status_code=400,
-                detail="El usuario plantilla no pertenece al User Group seleccionado",
-            )
 
+    with db_cursor() as cursor:
         cursor.execute("SELECT user FROM vicidial_users")
         existing = set(str(row["user"]).upper() for row in cursor.fetchall())
 
@@ -344,6 +438,7 @@ def create_users(payload: CreateRequest):
             ),
         )
 
+    # Nunca registrar ni devolver payload.agent_pass.
     raise HTTPException(
         status_code=501,
         detail="CP1 conectado. Motor de creación pendiente de CP2.",
