@@ -21,6 +21,9 @@ USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
 GROUP_TEMPLATES_FILE = Path(
     os.getenv("VICI_USERS_GROUP_TEMPLATES_FILE", "/etc/vici-users/group_templates.json")
 )
+GROUP_DEFAULTS_FILE = Path(
+    os.getenv("VICI_USERS_GROUP_DEFAULTS_FILE", "/etc/vici-users/group_defaults.json")
+)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -30,7 +33,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.4.0-group-template")
+app = FastAPI(title="Vici-Users API", version="0.5.0-group-defaults")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -64,31 +67,47 @@ def _read_astguiclient_conf():
     return values
 
 
-def load_group_templates():
-    # type: () -> Dict[str, str]
-    if not GROUP_TEMPLATES_FILE.exists():
+def _load_json_mapping(path, label):
+    if not path.exists():
         return {}
     try:
-        with GROUP_TEMPLATES_FILE.open("r") as fh:
+        with path.open("r") as fh:
             data = json.load(fh)
     except (ValueError, OSError) as exc:
         raise HTTPException(
             status_code=503,
-            detail="Configuración de plantillas inválida: %s" % exc,
+            detail="Configuración %s inválida: %s" % (label, exc),
         )
 
     if not isinstance(data, dict):
         raise HTTPException(
             status_code=503,
-            detail="group_templates.json debe contener un objeto JSON user_group -> template_user",
+            detail="%s debe contener un objeto JSON" % path.name,
         )
+    return data
 
+
+def load_group_templates():
+    # type: () -> Dict[str, str]
+    data = _load_json_mapping(GROUP_TEMPLATES_FILE, "de plantillas")
     clean = {}
     for group, user in data.items():
         group = str(group).strip()
         user = str(user).strip()
         if group and user:
             clean[group] = user
+    return clean
+
+
+def load_group_defaults():
+    # type: () -> Dict[str, str]
+    data = _load_json_mapping(GROUP_DEFAULTS_FILE, "de defaults")
+    clean = {}
+    for group, password in data.items():
+        group = str(group).strip()
+        password = str(password)
+        if group and password:
+            clean[group] = password
     return clean
 
 
@@ -183,6 +202,20 @@ def get_group_template(user_group):
         return cursor.fetchone()
 
 
+def resolve_agent_password(user_group, override_password=None):
+    """Resuelve password sin exponerlo. Override gana; si no, usa default server-side."""
+    if override_password:
+        return override_password
+    defaults = load_group_defaults()
+    password = defaults.get(user_group)
+    if not password:
+        raise HTTPException(
+            status_code=409,
+            detail="El User Group %s no tiene password default configurado" % user_group,
+        )
+    return password
+
+
 class PersonIn(BaseModel):
     first_names: str = Field(..., min_length=1, max_length=120)
     paternal: str = Field(..., min_length=1, max_length=80)
@@ -196,7 +229,7 @@ class PreviewRequest(BaseModel):
 
 class CreateRequest(PreviewRequest):
     usernames: List[str] = Field(..., min_items=1, max_items=500)
-    agent_pass: str = Field(..., min_length=1, max_length=100)
+    agent_pass: Optional[str] = Field(None, min_length=1, max_length=100)
 
 
 @app.get("/api/health")
@@ -222,6 +255,13 @@ def health():
         template_count = 0
         templates_ok = False
 
+    try:
+        default_count = len(load_group_defaults())
+        defaults_ok = True
+    except HTTPException:
+        default_count = 0
+        defaults_ok = False
+
     return {
         "status": "ok" if db_ok else "degraded",
         "app_node": socket.gethostname(),
@@ -239,12 +279,18 @@ def health():
         "group_templates_file": str(GROUP_TEMPLATES_FILE),
         "group_templates_ok": templates_ok,
         "group_templates_count": template_count,
+        "group_defaults_file": str(GROUP_DEFAULTS_FILE),
+        "group_defaults_ok": defaults_ok,
+        "group_defaults_count": default_count,
     }
 
 
 @app.get("/api/groups")
 def groups():
     templates = load_group_templates()
+    defaults = load_group_defaults()
+    configured_groups = set(templates.keys()) | set(defaults.keys())
+
     with db_cursor() as cursor:
         cursor.execute(
             """
@@ -257,20 +303,30 @@ def groups():
         )
         rows = cursor.fetchall()
 
+    # Cuando ya existe configuración local, el front operativo sólo muestra
+    # los grupos administrados por Vici-Users. Si aún no existe, muestra todos
+    # para facilitar el bootstrap inicial.
+    if configured_groups:
+        rows = [row for row in rows if row["user_group"] in configured_groups]
+
     for row in rows:
-        row["template_configured"] = row["user_group"] in templates
-        row["template_user"] = templates.get(row["user_group"])
+        group = row["user_group"]
+        row["template_configured"] = group in templates
+        row["template_user"] = templates.get(group)
+        row["default_password_configured"] = group in defaults
     return {"groups": rows}
 
 
 @app.get("/api/groups/{user_group}/template")
 def group_template(user_group):
     templates = load_group_templates()
+    defaults = load_group_defaults()
     configured_user = templates.get(user_group)
     if not configured_user:
         return {
             "user_group": user_group,
             "configured": False,
+            "default_password_configured": user_group in defaults,
             "template": None,
         }
 
@@ -287,6 +343,7 @@ def group_template(user_group):
     return {
         "user_group": user_group,
         "configured": True,
+        "default_password_configured": user_group in defaults,
         "template": template,
     }
 
@@ -419,6 +476,7 @@ def preview_users(payload: PreviewRequest):
 
     return {
         "template": template,
+        "default_password_configured": payload.user_group in load_group_defaults(),
         "requested": len(payload.people),
         "available": sum(1 for row in results if row["status"] == "AVAILABLE"),
         "resolved": sum(1 for row in results if row.get("resolved")),
@@ -438,7 +496,10 @@ def create_users(payload: CreateRequest):
             ),
         )
 
-    # Nunca registrar ni devolver payload.agent_pass.
+    # Resuelve la contraseña aquí, en servidor. Nunca imprimirla, registrarla ni devolverla.
+    _agent_pass = resolve_agent_password(payload.user_group, payload.agent_pass)
+    del _agent_pass
+
     raise HTTPException(
         status_code=501,
         detail="CP1 conectado. Motor de creación pendiente de CP2.",
