@@ -60,7 +60,9 @@
 </div>
 <div id="toast" class="toast"></div>
 <script>
-  const API = '/api';
+  const API = window.location.hostname.endsWith('github.io')
+    ? 'https://vicidial97.directo.com/vici-users-api'
+    : '/api';
   let apiHealth = null;
   let previewPayload = null;
 
