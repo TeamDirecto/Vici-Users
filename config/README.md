@@ -1,8 +1,12 @@
-# Plantillas por User Group
+# Configuración de User Groups y extensiones
 
-Vici-Users usa exactamente **un usuario plantilla por `user_group`**.
+Vici-Users usa exactamente **un usuario plantilla por `user_group`** y un bloque
+de extensiones para los grupos habilitados para alta.
 
-La configuración productiva no se guarda en GitHub. En `vici97` debe existir:
+## Plantillas
+
+La configuración productiva de plantillas no se guarda en GitHub. En `vici97`
+debe existir:
 
 ```text
 /etc/vici-users/group_templates.json
@@ -12,17 +16,49 @@ Formato:
 
 ```json
 {
-  "GRUPO_A": "USUARIO_BASE_A",
-  "GRUPO_B": "USUARIO_BASE_B"
+  "GRUPO_A": "BASE_A",
+  "GRUPO_B": "BASE_B"
 }
 ```
 
 Reglas:
 
 - el usuario base debe existir en `vicidial_users`;
-- debe estar `active='Y'`;
+- puede estar `active='N'` porque es una plantilla técnica;
 - debe pertenecer al mismo `user_group` configurado;
 - el frontend no puede sustituirlo por otro usuario;
-- el password de los usuarios nuevos no se toma de esta plantilla y no se almacena aquí.
+- el password de los usuarios nuevos no se toma de esta plantilla.
 
-`config/group_templates.example.json` se mantiene vacío intencionalmente para no publicar nombres internos de usuarios/grupos en el repositorio público.
+## Passwords default
+
+Los passwords default permanecen únicamente en:
+
+```text
+/etc/vici-users/group_defaults.json
+```
+
+No deben publicarse en GitHub ni devolverse al navegador.
+
+## Bloques de extensiones
+
+`config/extension_ranges.json` define los grupos habilitados para el flujo de
+alta y su bloque máximo de extensiones. Cada bloque puede contener como máximo
+50 posiciones.
+
+Un grupo administrado que no aparezca en ese archivo continúa existiendo para
+consulta/configuración, pero el backend rechaza su alta automática.
+
+Formato:
+
+```json
+{
+  "GRUPO_A": {
+    "start": 81001,
+    "end": 81050
+  }
+}
+```
+
+El archivo sólo define el bloque permitido. Todavía no implica que una posición
+esté libre, ocupada o reciclable; esa validación corresponde al inventario y al
+motor de provisión.
