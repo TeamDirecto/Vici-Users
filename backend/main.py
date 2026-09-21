@@ -2,6 +2,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,6 +37,12 @@ EXTENSION_RANGES_FILE = Path(
         str(APP_ROOT / "config" / "extension_ranges.json"),
     )
 )
+INVENTORY_DB_FILE = Path(
+    os.getenv(
+        "VICI_USERS_INVENTORY_DB",
+        "/var/lib/vici-users/extension_inventory.db",
+    )
+)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -45,7 +52,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.8.0-extension-ranges")
+app = FastAPI(title="Vici-Users API", version="0.9.0-extension-inventory")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -214,6 +221,194 @@ def require_provisioning_group(user_group):
     return ranges[user_group]
 
 
+
+def ensure_inventory_db():
+    # type: () -> None
+    try:
+        INVENTORY_DB_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS extension_inventory (
+                    extension TEXT PRIMARY KEY,
+                    user_group TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    current_user TEXT,
+                    previous_user TEXT,
+                    reserved_at TEXT,
+                    assigned_at TEXT,
+                    released_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    note TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS extension_inventory_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    extension TEXT NOT NULL,
+                    user_group TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    old_status TEXT,
+                    new_status TEXT,
+                    user_name TEXT,
+                    detail TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_extension_inventory_group_status "
+                "ON extension_inventory(user_group, status)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_extension_events_extension "
+                "ON extension_inventory_events(extension, created_at)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        os.chmod(str(INVENTORY_DB_FILE), 0o600)
+    except (OSError, sqlite3.Error) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="No fue posible preparar el inventario local de extensiones: %s" % exc,
+        )
+
+
+def load_local_inventory(user_group):
+    # type: (str) -> Dict[str, Dict[str, Optional[str]]]
+    ensure_inventory_db()
+    connection = None
+    try:
+        connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT extension, user_group, status, current_user, previous_user,
+                   reserved_at, assigned_at, released_at, updated_at, note
+              FROM extension_inventory
+             WHERE user_group=?
+            """,
+            (user_group,),
+        ).fetchall()
+        return dict((str(row["extension"]), dict(row)) for row in rows)
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="No fue posible consultar el inventario local de extensiones: %s" % exc,
+        )
+    finally:
+        if connection:
+            connection.close()
+
+
+def extension_inventory_snapshot(user_group):
+    extension_range = require_provisioning_group(user_group)
+    start = extension_range["start"]
+    end = extension_range["end"]
+    extensions = [str(value) for value in range(start, end + 1)]
+    placeholders = ",".join(["%s"] * len(extensions))
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT extension, server_ip, active, user_group
+              FROM phones
+             WHERE extension IN (%s)
+             ORDER BY extension, server_ip
+            """ % placeholders,
+            tuple(extensions),
+        )
+        phone_rows = cursor.fetchall()
+
+    phones_by_extension = dict((extension, []) for extension in extensions)
+    for row in phone_rows:
+        extension = str(row.get("extension") or "")
+        if extension in phones_by_extension:
+            phones_by_extension[extension].append(row)
+
+    local_inventory = load_local_inventory(user_group)
+    positions = []
+    counts = {
+        "UNCREATED": 0,
+        "LEGACY": 0,
+        "FREE": 0,
+        "RESERVED": 0,
+        "IN_USE": 0,
+        "ERROR": 0,
+    }
+    mismatches = 0
+
+    for extension in extensions:
+        rows = phones_by_extension.get(extension, [])
+        tracked = local_inventory.get(extension)
+        if tracked:
+            status = str(tracked.get("status") or "ERROR").upper()
+            if status not in counts:
+                status = "ERROR"
+        elif rows:
+            status = "LEGACY"
+        else:
+            status = "UNCREATED"
+
+        counts[status] += 1
+
+        phone_groups = sorted(set(
+            str(row.get("user_group") or "").strip()
+            for row in rows
+            if str(row.get("user_group") or "").strip()
+        ))
+        servers = sorted(set(
+            str(row.get("server_ip") or "").strip()
+            for row in rows
+            if str(row.get("server_ip") or "").strip()
+        ))
+
+        if not rows:
+            alignment = "N/A"
+        elif phone_groups == [user_group]:
+            alignment = "ALIGNED"
+        else:
+            alignment = "MISMATCH"
+            mismatches += 1
+
+        positions.append({
+            "extension": extension,
+            "status": status,
+            "managed_by_portal": tracked is not None,
+            "server_count": len(servers),
+            "servers": servers,
+            "active_rows": sum(
+                1 for row in rows if str(row.get("active") or "").upper() == "Y"
+            ),
+            "phone_groups": phone_groups,
+            "group_alignment": alignment,
+            "current_user": tracked.get("current_user") if tracked else None,
+            "previous_user": tracked.get("previous_user") if tracked else None,
+            "released_at": tracked.get("released_at") if tracked else None,
+            "updated_at": tracked.get("updated_at") if tracked else None,
+        })
+
+    return {
+        "user_group": user_group,
+        "extension_range": extension_range,
+        "summary": {
+            "capacity": len(extensions),
+            "uncreated": counts["UNCREATED"],
+            "legacy": counts["LEGACY"],
+            "free": counts["FREE"],
+            "reserved": counts["RESERVED"],
+            "in_use": counts["IN_USE"],
+            "error": counts["ERROR"],
+            "group_mismatches": mismatches,
+        },
+        "positions": positions,
+    }
+
+
 def db_config():
     conf = _read_astguiclient_conf()
     host = os.getenv("VICI_DB_HOST", conf.get("host", EXPECTED_DB_HOST))
@@ -378,6 +573,12 @@ def health():
         extension_ranges_count = 0
         extension_ranges_ok = False
 
+    try:
+        ensure_inventory_db()
+        inventory_db_ok = True
+    except HTTPException:
+        inventory_db_ok = False
+
     return {
         "status": "ok" if db_ok else "degraded",
         "app_node": socket.gethostname(),
@@ -404,6 +605,8 @@ def health():
         "extension_ranges_file": str(EXTENSION_RANGES_FILE),
         "extension_ranges_ok": extension_ranges_ok,
         "extension_ranges_count": extension_ranges_count,
+        "inventory_db_file": str(INVENTORY_DB_FILE),
+        "inventory_db_ok": inventory_db_ok,
     }
 
 
@@ -524,6 +727,11 @@ def group_extension_range(user_group):
         "provisioning_enabled": True,
         "extension_range": extension_range,
     }
+
+
+@app.get("/api/groups/{user_group}/extensions/inventory")
+def group_extension_inventory(user_group):
+    return extension_inventory_snapshot(user_group)
 
 
 @app.post("/api/users/preview")
