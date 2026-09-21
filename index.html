@@ -21,7 +21,7 @@
 
   <main class="main">
     <header class="top">
-      <div><div class="eyebrow">EHECTO · ADMINISTRACIÓN</div><h1>Alta masiva de usuarios</h1><div class="sub">Cada User Group utiliza un usuario base y una contraseña default protegidos en vici97.</div></div>
+      <div><div class="eyebrow">EHECTO · ADMINISTRACIÓN</div><h1>Alta masiva de usuarios</h1><div class="sub">Alta de usuario + extensión: cada User Group utiliza un BASE_* y una contraseña default protegidos en vici97.</div></div>
       <div class="status-pill"><span id="topDot" class="dot"></span><strong id="connectionText">Conectando…</strong></div>
     </header>
 
@@ -52,19 +52,24 @@
             <div class="password-box"><input id="agentPass" type="password" autocomplete="new-password" placeholder="Vacío = usar password default del grupo" /><button id="togglePass" type="button">Mostrar</button></div>
             <div class="hint">Si queda vacío, el backend usará el default del grupo. El valor default nunca se envía al navegador ni se almacena en GitHub.</div>
           </div>
+          <div class="field">
+            <label>Extensión</label>
+            <input id="extensionRule" type="text" value="Pendiente de definir regla de numeración" disabled />
+            <div class="hint">CP2 quedará preparado para crear <strong>usuario + extensión</strong> como una sola operación. No se asignará ninguna extensión hasta definir rango y lógica.</div>
+          </div>
           <div class="field"><label>Personas</label><textarea id="bulkText" placeholder="Juan Carlos,Pérez,López&#10;María Fernanda,Hernández,Soto&#10;Luis,Gómez,Ruiz"></textarea><div class="hint">Una persona por línea: <strong>Nombre(s), Apellido paterno, Apellido materno</strong>.</div></div>
-          <div class="rule"><strong>Regla EHECTO</strong><br>Primera letra del apellido paterno + primer nombre. Si existe, amplía el apellido: <code>PJUAN → PEJUAN → PERJUAN…</code>.</div>
+          <div class="rule"><strong>Regla EHECTO</strong><br>Primera letra del apellido paterno + primer nombre. Si existe, amplía el apellido: <code>PJUAN → PEJUAN → PERJUAN…</code>.<br><br><strong>CP2:</strong> el alta sólo se considerará completa cuando existan tanto el usuario VICIdial como su extensión.</div>
           <div class="btns"><button class="btn primary" id="previewBtn" disabled>Previsualizar y validar</button><button class="btn secondary" id="demoBtn">Cargar ejemplo</button></div>
         </div>
       </div>
 
       <div class="card">
-        <div class="head"><div><h2>Previsualización</h2><p>vici97 valida usernames contra vici222 y decide la plantilla.</p></div><span class="step">Paso 2</span></div>
-        <div id="empty" class="empty"><strong>Aún no hay usuarios para revisar</strong><p>Selecciona un grupo con plantilla y valida el lote.</p></div>
+        <div class="head"><div><h2>Previsualización</h2><p>vici97 valida username, BASE_* y password default. La extensión se habilitará al definir su regla.</p></div><span class="step">Paso 2</span></div>
+        <div id="empty" class="empty"><strong>Aún no hay altas para revisar</strong><p>Selecciona un grupo con BASE_* y valida el lote. La extensión aparecerá como pendiente hasta definir la numeración.</p></div>
         <div id="preview" class="hidden">
           <div class="toolbar"><strong id="previewSummary">0 registros</strong><span id="templateBadge" class="badge gray">Plantilla —</span></div>
-          <div class="table-wrap"><table><thead><tr><th>Persona</th><th>Inicial</th><th>Username final</th><th>Resultado</th><th>Intentos</th></tr></thead><tbody id="rows"></tbody></table></div>
-          <div class="footer"><small id="createNote">CP1: consulta real en vici222. Escritura protegida.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuarios</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Persona</th><th>Inicial</th><th>Username final</th><th>Extensión</th><th>Resultado</th><th>Intentos</th></tr></thead><tbody id="rows"></tbody></table></div>
+          <div class="footer"><small id="createNote">CP1 validado. CP2 usuario + extensión pendiente de regla de numeración.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuario + extensión</button></div></div>
         </div>
       </div>
     </section>
@@ -72,7 +77,7 @@
 </div>
 <div id="toast" class="toast"></div>
 <script>
-  const API = window.location.hostname.endsWith('github.io')
+  const API = window.location.hostname === 'teamdirecto.github.io'
     ? 'https://vicidial97.directo.com/vici-users-api'
     : '/api';
   let apiHealth = null;
@@ -89,7 +94,7 @@
   async function boot(){
     try{
       apiHealth=await api('/health');if(!apiHealth.db_ok)throw new Error('Backend activo, pero no hay conexión con vici222.');
-      setConnection(true,`${apiHealth.app_node} → ${apiHealth.db_node||'vici222'} · conectado`);$('connectionError').classList.add('hidden');await loadGroups();$('createBtn').disabled=!apiHealth.create_enabled;$('createNote').textContent=apiHealth.create_enabled?'Modo creación habilitado en backend.':'CP1: lectura y preview real; escritura deshabilitada.';
+      setConnection(true,`${apiHealth.app_node} → ${apiHealth.db_node||'vici222'} · conectado`);$('connectionError').classList.add('hidden');await loadGroups();$('createBtn').disabled=!apiHealth.create_enabled;$('createNote').textContent=apiHealth.create_enabled?'Backend en modo creación; extensión aún requiere regla de numeración.':'CP1 validado: escritura deshabilitada. CP2 será usuario + extensión.';
     }catch(error){setConnection(false,'Sin conexión');$('connectionError').textContent=error.message;$('connectionError').classList.remove('hidden');$('userGroup').innerHTML='<option>No disponible</option>'}
   }
 
@@ -120,13 +125,13 @@
 
   function renderPreview(data){
     $('statTotal').textContent=data.requested;$('statAvailable').textContent=data.available;$('statResolved').textContent=data.resolved;$('statConflict').textContent=data.conflicts;$('previewSummary').textContent=`${data.requested} registro${data.requested===1?'':'s'}`;$('templateBadge').textContent=`Plantilla ${data.template.user}`;
-    $('rows').innerHTML=data.users.map(u=>{const status=u.status==='AVAILABLE'?(u.resolved?'<span class="badge amber">Colisión resuelta</span>':'<span class="badge green">Disponible</span>'):'<span class="badge red">Conflicto</span>';const person=`${u.first_names} ${u.paternal} ${u.maternal||''}`.trim();return `<tr><td><strong>${escapeHtml(person)}</strong></td><td><code>${escapeHtml(u.initial||'—')}</code></td><td><code>${escapeHtml(u.username||'—')}</code></td><td>${status}</td><td>${escapeHtml((u.attempts||[]).join(' → ')||u.reason||'—')}</td></tr>`}).join('');$('empty').classList.add('hidden');$('preview').classList.remove('hidden')
+    $('rows').innerHTML=data.users.map(u=>{const status=u.status==='AVAILABLE'?(u.resolved?'<span class="badge amber">Colisión resuelta</span>':'<span class="badge green">Disponible</span>'):'<span class="badge red">Conflicto</span>';const person=`${u.first_names} ${u.paternal} ${u.maternal||''}`.trim();return `<tr><td><strong>${escapeHtml(person)}</strong></td><td><code>${escapeHtml(u.initial||'—')}</code></td><td><code>${escapeHtml(u.username||'—')}</code></td><td><span class="badge gray">Pendiente regla</span></td><td>${status}</td><td>${escapeHtml((u.attempts||[]).join(' → ')||u.reason||'—')}</td></tr>`}).join('');$('empty').classList.add('hidden');$('preview').classList.remove('hidden')
   }
 
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
   $('togglePass').addEventListener('click',()=>{const f=$('agentPass');const show=f.type==='password';f.type=show?'text':'password';$('togglePass').textContent=show?'Ocultar':'Mostrar'});
   $('demoBtn').addEventListener('click',()=>{$('bulkText').value='Juan Carlos,Pérez,López\nMaría Fernanda,Hernández,Ruiz\nKristian Michell,Maya,Guzmán\nJosé Luis,Hernández,Soto';toast('Ejemplo cargado. Selecciona un grupo con plantilla configurada.')});
-  $('createBtn').addEventListener('click',()=>{const override=$('agentPass').value;toast(override?'Se usaría el override indicado para este lote. CP1 aún no escribe.':'Se usaría el password default del grupo. CP1 aún no escribe.')});
+  $('createBtn').addEventListener('click',()=>{toast('CP2 todavía no se habilita: falta definir la regla/rango de extensiones. No se escribió nada.')});
   boot();
 </script>
 </body>
