@@ -3,115 +3,187 @@ set -Eeuo pipefail
 
 APP_DIR="/opt/vici-users"
 CFG_DIR="/etc/vici-users"
-CFG_FILE="${CFG_DIR}/group_templates.json"
+TEMPLATES_FILE="${CFG_DIR}/group_templates.json"
 GROUPS_FILE="${APP_DIR}/config/managed_groups.json"
+DEFAULTS_FILE="${CFG_DIR}/group_defaults.json"
 PYTHON_BIN="${APP_DIR}/.venv/bin/python"
+APPLY=0
+
+if [ "${1:-}" = "--apply" ]; then
+  APPLY=1
+elif [ -n "${1:-}" ]; then
+  echo "Uso: $0 [--apply]" >&2
+  exit 1
+fi
 
 [ "$(id -u)" -eq 0 ] || { echo "[ERROR] Ejecuta como root" >&2; exit 1; }
 [ -x "$PYTHON_BIN" ] || { echo "[ERROR] No existe $PYTHON_BIN" >&2; exit 1; }
 [ -f "$GROUPS_FILE" ] || { echo "[ERROR] No existe $GROUPS_FILE" >&2; exit 1; }
-cd "$APP_DIR"
+[ -f "$DEFAULTS_FILE" ] || { echo "[ERROR] No existe $DEFAULTS_FILE" >&2; exit 1; }
 
+cd "$APP_DIR"
 mkdir -p "$CFG_DIR"
 chmod 0750 "$CFG_DIR"
 
-if [ -f "$CFG_FILE" ]; then
-  TS="$(date +%Y%m%d_%H%M%S)"
-  cp -a "$CFG_FILE" "${CFG_FILE}.bak_${TS}"
-  echo "[OK] Backup: ${CFG_FILE}.bak_${TS}"
-fi
-
-"$PYTHON_BIN" - "$CFG_FILE" "$GROUPS_FILE" <<'PY'
+"$PYTHON_BIN" - "$GROUPS_FILE" "$DEFAULTS_FILE" "$TEMPLATES_FILE" "$APPLY" <<'PY'
 import json
 import os
+import re
 import sys
 
 from backend.main import db_cursor
 
-path = sys.argv[1]
-groups_path = sys.argv[2]
+groups_path, defaults_path, templates_path, apply_raw = sys.argv[1:5]
+apply_changes = apply_raw == "1"
+
 with open(groups_path, "r") as fh:
-    groups = json.load(fh)
-groups = [str(g).strip() for g in groups if str(g).strip()]
+    groups = [str(x).strip() for x in json.load(fh) if str(x).strip()]
 
-existing = {}
-if os.path.exists(path):
-    try:
-        with open(path, "r") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            existing = {str(k): str(v) for k, v in data.items() if v}
-    except Exception:
-        pass
+with open(defaults_path, "r") as fh:
+    defaults = json.load(fh)
 
-result = dict(existing)
+missing_defaults = [g for g in groups if not defaults.get(g)]
+if missing_defaults:
+    print("[ERROR] Faltan passwords default:")
+    for group in missing_defaults:
+        print("  %s" % group)
+    sys.exit(2)
 
-for group in groups:
-    print("\n=== %s ===" % group)
-    with db_cursor() as cursor:
+def base_user(group):
+    prefix = "CC-CORTIZO-"
+    suffix = group[len(prefix):] if group.startswith(prefix) else group
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", suffix).strip("_").upper()
+    candidate = "BASE_" + suffix
+    if len(candidate) > 20:
+        candidate = candidate[:20]
+    return candidate
+
+plan = []
+with db_cursor() as cursor:
+    for group in groups:
+        username = base_user(group)
+
+        cursor.execute(
+            "SELECT user, user_group, user_level, active, full_name "
+            "FROM vicidial_users WHERE user=%s LIMIT 1",
+            (username,),
+        )
+        existing = cursor.fetchone()
+
         cursor.execute(
             """
-            SELECT user, full_name, user_level, active
+            SELECT user, full_name, user_level
               FROM vicidial_users
              WHERE user_group=%s
                AND active='Y'
                AND user_level=1
              ORDER BY user
-             LIMIT 20
+             LIMIT 1
             """,
             (group,),
         )
-        rows = cursor.fetchall()
+        source = cursor.fetchone()
 
-    if not rows:
-        print("[WARN] No hay usuarios activos nivel 1 en este grupo.")
-        continue
+        if existing:
+            if existing["user_group"] != group:
+                print("[ERROR] %s ya existe pero pertenece a %s, no a %s"
+                      % (username, existing["user_group"], group))
+                sys.exit(3)
+            plan.append((group, username, "EXISTS", existing.get("full_name") or ""))
+            continue
 
-    current = existing.get(group)
-    for idx, row in enumerate(rows, start=1):
-        marker = " *actual*" if row["user"] == current else ""
-        print("%2d) %-20s %s%s" % (idx, row["user"], row.get("full_name") or "", marker))
+        if not source:
+            plan.append((group, username, "NO_SOURCE", ""))
+            continue
 
-    default_idx = None
-    if current:
-        for idx, row in enumerate(rows, start=1):
-            if row["user"] == current:
-                default_idx = idx
-                break
-    if default_idx is None:
-        default_idx = 1
+        plan.append((group, username, "CREATE", source["user"]))
 
-    raw = input("Selecciona usuario base [%d]: " % default_idx).strip()
-    if not raw:
-        choice = default_idx
+print("")
+print("PLAN DE USUARIOS BASE")
+print("======================")
+for group, username, action, source in plan:
+    if action == "CREATE":
+        print("[CREATE] %-24s -> %-20s desde %s" % (group, username, source))
+    elif action == "EXISTS":
+        print("[OK]     %-24s -> %-20s ya existe" % (group, username))
     else:
-        try:
-            choice = int(raw)
-        except ValueError:
-            print("[WARN] Selección inválida; se conserva/usa el default.")
-            choice = default_idx
+        print("[WARN]   %-24s -> %-20s sin agente nivel 1 activo" % (group, username))
 
-    if choice < 1 or choice > len(rows):
-        print("[WARN] Selección fuera de rango; se conserva/usa el default.")
-        choice = default_idx
+if not apply_changes:
+    print("")
+    print("[DRY-RUN] No se escribió nada.")
+    print("Revisa el plan y después ejecuta:")
+    print("  ./configure-base-users.sh --apply")
+    sys.exit(0)
 
-    selected = rows[choice - 1]["user"]
-    result[group] = selected
-    print("[OK] %s -> %s" % (group, selected))
+created = 0
+skipped = 0
+templates = {}
 
-with open(path, "w") as fh:
-    json.dump(result, fh, indent=2, sort_keys=True)
+with db_cursor() as cursor:
+    for group, username, action, source in plan:
+        if action == "NO_SOURCE":
+            print("[WARN] %s omitido: no hay fuente nivel 1 activa" % group)
+            skipped += 1
+            continue
+
+        if action == "EXISTS":
+            templates[group] = username
+            continue
+
+        password = defaults[group]
+
+        # Se crea una plantilla técnica mínima. No se clonan credenciales,
+        # phone_login, email ni otros identificadores del agente fuente.
+        cursor.execute(
+            """
+            INSERT INTO vicidial_users
+                (user, pass, full_name, user_level, user_group, active)
+            VALUES
+                (%s, %s, %s, 1, %s, 'N')
+            """,
+            (
+                username,
+                password,
+                "Usuario Base %s" % group,
+                group,
+            ),
+        )
+        templates[group] = username
+        created += 1
+        print("[OK] Creado %s para %s" % (username, group))
+
+# Conserva mapeos ajenos sólo si ya existían, pero sobrescribe los administrados.
+existing_templates = {}
+if os.path.exists(templates_path):
+    try:
+        with open(templates_path, "r") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            existing_templates = dict(data)
+    except Exception:
+        pass
+
+existing_templates.update(templates)
+with open(templates_path, "w") as fh:
+    json.dump(existing_templates, fh, indent=2, sort_keys=True)
     fh.write("\n")
-os.chmod(path, 0o640)
+os.chmod(templates_path, 0o640)
 
-print("\n[OK] Archivo actualizado: %s" % path)
-print("[OK] Grupos con usuario base: %d" % len(result))
+print("")
+print("[OK] Usuarios base creados: %d" % created)
+print("[OK] Plantillas configuradas: %d" % len(templates))
+print("[WARN] Grupos omitidos: %d" % skipped)
 PY
 
-chown root:root "$CFG_FILE"
-chmod 0640 "$CFG_FILE"
+if [ "$APPLY" -eq 1 ]; then
+  chown root:root "$TEMPLATES_FILE"
+  chmod 0640 "$TEMPLATES_FILE"
 
-echo
-echo "Después reinicia:"
-echo "  systemctl restart vici-users"
-echo "  curl -s http://127.0.0.1:8094/api/groups | /opt/vici-users/.venv/bin/python -m json.tool"
+  echo
+  echo "Reinicia la API:"
+  echo "  systemctl restart vici-users"
+  echo
+  echo "Valida:"
+  echo "  curl -s http://127.0.0.1:8094/api/health | $PYTHON_BIN -m json.tool"
+fi
