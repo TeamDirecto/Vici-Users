@@ -1,0 +1,26 @@
+{
+  "cluster": "EHECTO",
+  "nodes": [
+    {
+      "server_ip": "172.20.20.110",
+      "enabled": true
+    },
+    {
+      "server_ip": "172.20.20.233",
+      "enabled": true
+    },
+    {
+      "server_ip": "172.20.21.90",
+      "enabled": true
+    },
+    {
+      "server_ip": "172.20.21.94",
+      "enabled": false,
+      "note": "Excluido temporalmente por problemas de registro de extensiones"
+    },
+    {
+      "server_ip": "172.20.21.96",
+      "enabled": true
+    }
+  ]
+}
