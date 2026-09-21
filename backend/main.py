@@ -39,7 +39,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.7.0-dedicated-base-users")
+app = FastAPI(title="Vici-Users API", version="0.7.1-inactive-base-template-fix")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -236,7 +236,6 @@ def get_group_template(user_group):
               FROM vicidial_users
              WHERE user=%s
                AND user_group=%s
-               AND active='Y'
              LIMIT 1
             """,
             (template_user, user_group),
