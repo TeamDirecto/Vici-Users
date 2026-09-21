@@ -1,0 +1,74 @@
+{
+  "CC-CORTIZO-BANCO-AZT": {
+    "start": 81001,
+    "end": 81050
+  },
+  "CC-CORTIZO-BANORTE": {
+    "start": 90101,
+    "end": 90150
+  },
+  "CC-CORTIZO-BBVA": {
+    "start": 90200,
+    "end": 90249
+  },
+  "CC-CORTIZO-GMF": {
+    "start": 97101,
+    "end": 97150
+  },
+  "CC-CORTIZO-LABORATOR": {
+    "start": 84200,
+    "end": 84249
+  },
+  "CC-CORTIZO-LIBERTAD": {
+    "start": 86001,
+    "end": 86050
+  },
+  "CC-CORTIZO-NISSAN": {
+    "start": 85001,
+    "end": 85050
+  },
+  "CC-CORTIZO-NISSAN-LA": {
+    "start": 84001,
+    "end": 84050
+  },
+  "CC-CORTIZO-RAPIDAUTO": {
+    "start": 80101,
+    "end": 80150
+  },
+  "CC-CORTIZO-SA": {
+    "start": 95301,
+    "end": 95350
+  },
+  "CC-CORTIZO-SCOTI": {
+    "start": 98300,
+    "end": 98349
+  },
+  "CC-CORTIZO-SCOTI-AUT": {
+    "start": 98101,
+    "end": 98150
+  },
+  "CC-CORTIZO-SCOTI-PR": {
+    "start": 98200,
+    "end": 98249
+  },
+  "CC-CORTIZO-SICREA": {
+    "start": 83001,
+    "end": 83050
+  },
+  "CC-CORTIZO-TOTALPLAY": {
+    "start": 96101,
+    "end": 96150
+  },
+  "CC-CORTIZO-TOYOTA": {
+    "start": 82001,
+    "end": 82050
+  },
+  "CC-CORTIZO-UNIFIN": {
+    "start": 91001,
+    "end": 91050
+  },
+  "CC-CORTIZO-VW": {
+    "start": 95201,
+    "end": 95250
+  }
+}
