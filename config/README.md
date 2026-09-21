@@ -87,3 +87,20 @@ marcado `FREE` después de completar correctamente una reasignación.
 
 El endpoint de inventario público devuelve sólo un resumen y no publica IPs de
 dialers ni el detalle completo de posiciones.
+
+
+## Topología efectiva de provisión
+
+`config/cluster_nodes.json` define qué dialers forman parte de una creación de
+extensión. Un nodo con `enabled=false` sigue perteneciendo al cluster, pero no
+es obligatorio para considerar completa una provisión nueva.
+
+Actualmente EHECTO trabaja con 4 nodos obligatorios y 1 nodo temporalmente
+excluido por problemas de registro. Las filas ya existentes en un nodo
+deshabilitado siguen siendo visibles al inventario y nunca hacen que una
+extensión pase a `UNCREATED`.
+
+Cuando el nodo excluido vuelva a estar operativo, basta con cambiar su bandera a
+`enabled=true`; a partir de ese momento la validación de topología exigirá de
+nuevo 5/5 nodos. Antes de habilitarlo para nuevas altas debe ejecutarse un fix
+para completar las extensiones que hayan sido creadas durante el periodo 4/4.
