@@ -150,3 +150,28 @@ para una extensión concreta. El dry-run:
 Como `phones` y `vicidial_users` son MyISAM, el futuro motor de escritura no
 puede depender de ROLLBACK transaccional. El diseño usa compensación explícita
 y validación posterior.
+
+
+## Dry-run exacto de escritura usuario + extensión
+
+El endpoint `POST /api/provisioning/write-plan` genera el plan exacto de una
+alta sin ejecutar escrituras. Usa el mismo allowlist funcional de usuarios que
+`configure-base-users.sh` y construye, por cada nodo habilitado, un
+`INSERT ... SELECT` explícito sobre `phones`.
+
+El plan:
+
+- valida que el username no exista;
+- valida de nuevo extensión, login y dialplan;
+- usa el `BASE_*` del User Group como fuente del usuario;
+- usa una extensión activa del mismo grupo/nodo como fuente de `phones`;
+- crea conceptualmente los phones con `active=N`;
+- copia `conf_secret` desde la plantilla sin devolver su valor;
+- sustituye extension, dialplan_number, voicemail_id, login, pass, user_group y active;
+- detecta referencias no mapeadas a la extensión fuente en otros campos y bloquea el plan;
+- describe la activación final y el rollback compensatorio requerido por MyISAM;
+- nunca devuelve el password default del grupo y nunca ejecuta INSERT/UPDATE/DELETE.
+
+`VICI_USERS_ENABLE_CREATE=false` debe permanecer así hasta que este plan sea
+validado y se implementen autenticación, auditoría e idempotencia para la
+escritura real.
