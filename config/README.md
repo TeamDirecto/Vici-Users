@@ -104,3 +104,30 @@ Cuando el nodo excluido vuelva a estar operativo, basta con cambiar su bandera a
 `enabled=true`; a partir de ese momento la validación de topología exigirá de
 nuevo 5/5 nodos. Antes de habilitarlo para nuevas altas debe ejecutarse un fix
 para completar las extensiones que hayan sido creadas durante el periodo 4/4.
+
+
+## Regla canónica de identidad para nuevas extensiones
+
+Las extensiones históricas pueden tener sufijos y prefijos diferentes porque
+fueron creadas con distintos órdenes de bulk. El portal no intenta normalizar
+ni reescribir esos registros legacy.
+
+Para nuevas provisiones se usa `identity_policy=canonical-v1`:
+
+- 172.20.20.233 → sufijo `a`, sin prefijo de dialplan;
+- 172.20.21.90 → sufijo `b`, prefijo `1`;
+- 172.20.21.96 → sufijo `c`, prefijo `2`;
+- 172.20.20.110 → sufijo `d`, prefijo `3`;
+- 172.20.21.94 → sufijo `e`, prefijo `4`, temporalmente deshabilitado.
+
+Ejemplo para extensión 95217:
+
+```text
+172.20.20.233 -> login 95217a -> dialplan 95217
+172.20.21.90  -> login 95217b -> dialplan 195217
+172.20.21.96  -> login 95217c -> dialplan 295217
+172.20.20.110 -> login 95217d -> dialplan 395217
+172.20.21.94  -> login 95217e -> dialplan 495217 (no se crea mientras esté disabled)
+```
+
+Esta regla aplica sólo a altas nuevas administradas por Vici-Users.
