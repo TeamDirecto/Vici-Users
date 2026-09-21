@@ -43,6 +43,12 @@ INVENTORY_DB_FILE = Path(
         "/var/lib/vici-users/extension_inventory.db",
     )
 )
+CLUSTER_NODES_FILE = Path(
+    os.getenv(
+        "VICI_USERS_CLUSTER_NODES_FILE",
+        str(APP_ROOT / "config" / "cluster_nodes.json"),
+    )
+)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -52,7 +58,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.9.0-extension-inventory")
+app = FastAPI(title="Vici-Users API", version="0.10.0-cluster-topology")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -198,6 +204,48 @@ def load_extension_ranges():
     return clean
 
 
+def load_cluster_nodes():
+    data = _load_json_mapping(CLUSTER_NODES_FILE, "de topología del cluster")
+    raw_nodes = data.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise HTTPException(
+            status_code=503,
+            detail="cluster_nodes.json debe contener una lista nodes no vacía",
+        )
+
+    nodes = []
+    seen = set()
+    for item in raw_nodes:
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=503,
+                detail="Nodo inválido en cluster_nodes.json",
+            )
+        server_ip = str(item.get("server_ip") or "").strip()
+        if not server_ip or server_ip in seen:
+            raise HTTPException(
+                status_code=503,
+                detail="server_ip vacío o duplicado en cluster_nodes.json",
+            )
+        seen.add(server_ip)
+        nodes.append({
+            "server_ip": server_ip,
+            "enabled": bool(item.get("enabled", True)),
+            "note": str(item.get("note") or "").strip(),
+        })
+
+    if not any(node["enabled"] for node in nodes):
+        raise HTTPException(
+            status_code=503,
+            detail="La topología no tiene nodos habilitados para provisión",
+        )
+
+    return {
+        "cluster": str(data.get("cluster") or "EHECTO"),
+        "nodes": nodes,
+    }
+
+
 def require_managed_group(user_group):
     managed = set(load_managed_groups())
     if user_group not in managed:
@@ -307,6 +355,11 @@ def load_local_inventory(user_group):
 
 def extension_inventory_snapshot(user_group):
     extension_range = require_provisioning_group(user_group)
+    topology = load_cluster_nodes()
+    enabled_servers = set(
+        node["server_ip"] for node in topology["nodes"] if node["enabled"]
+    )
+    known_servers = set(node["server_ip"] for node in topology["nodes"])
     start = extension_range["start"]
     end = extension_range["end"]
     extensions = [str(value) for value in range(start, end + 1)]
@@ -341,6 +394,8 @@ def extension_inventory_snapshot(user_group):
         "ERROR": 0,
     }
     mismatches = 0
+    incomplete = 0
+    unexpected_server_rows = 0
 
     for extension in extensions:
         rows = phones_by_extension.get(extension, [])
@@ -366,6 +421,11 @@ def extension_inventory_snapshot(user_group):
             for row in rows
             if str(row.get("server_ip") or "").strip()
         ))
+        server_set = set(servers)
+        enabled_present = server_set.intersection(enabled_servers)
+        missing_enabled = sorted(enabled_servers.difference(server_set))
+        unexpected_servers = sorted(server_set.difference(known_servers))
+        unexpected_server_rows += len(unexpected_servers)
 
         if not rows:
             alignment = "N/A"
@@ -375,12 +435,29 @@ def extension_inventory_snapshot(user_group):
             alignment = "MISMATCH"
             mismatches += 1
 
+        if not rows:
+            topology_status = "UNCREATED"
+            topology_complete = False
+        elif not missing_enabled:
+            topology_status = "COMPLETE"
+            topology_complete = True
+        else:
+            topology_status = "INCOMPLETE"
+            topology_complete = False
+            incomplete += 1
+
         positions.append({
             "extension": extension,
             "status": status,
             "managed_by_portal": tracked is not None,
             "server_count": len(servers),
+            "enabled_server_count": len(enabled_present),
+            "expected_enabled_server_count": len(enabled_servers),
             "servers": servers,
+            "missing_enabled_servers": missing_enabled,
+            "unexpected_servers": unexpected_servers,
+            "topology_status": topology_status,
+            "topology_complete": topology_complete,
             "active_rows": sum(
                 1 for row in rows if str(row.get("active") or "").upper() == "Y"
             ),
@@ -393,7 +470,8 @@ def extension_inventory_snapshot(user_group):
         })
 
     free_candidates = [
-        row["extension"] for row in positions if row["status"] == "FREE"
+        row["extension"] for row in positions
+        if row["status"] == "FREE" and row["topology_complete"]
     ]
     uncreated_candidates = [
         row["extension"] for row in positions if row["status"] == "UNCREATED"
@@ -419,11 +497,14 @@ def extension_inventory_snapshot(user_group):
             "in_use": counts["IN_USE"],
             "error": counts["ERROR"],
             "group_mismatches": mismatches,
+            "topology_incomplete": incomplete,
+            "expected_enabled_nodes": len(enabled_servers),
+            "disabled_nodes": len(topology["nodes"]) - len(enabled_servers),
+            "unexpected_server_rows": unexpected_server_rows,
             "next_candidate": next_candidate,
             "next_candidate_source": next_candidate_source,
         },
     }
-
 
 def db_config():
     conf = _read_astguiclient_conf()
@@ -595,6 +676,16 @@ def health():
     except HTTPException:
         inventory_db_ok = False
 
+    try:
+        topology = load_cluster_nodes()
+        provisioning_nodes_count = sum(1 for node in topology["nodes"] if node["enabled"])
+        disabled_nodes_count = sum(1 for node in topology["nodes"] if not node["enabled"])
+        cluster_topology_ok = True
+    except HTTPException:
+        provisioning_nodes_count = 0
+        disabled_nodes_count = 0
+        cluster_topology_ok = False
+
     return {
         "status": "ok" if db_ok else "degraded",
         "app_node": socket.gethostname(),
@@ -623,6 +714,10 @@ def health():
         "extension_ranges_count": extension_ranges_count,
         "inventory_db_file": str(INVENTORY_DB_FILE),
         "inventory_db_ok": inventory_db_ok,
+        "cluster_nodes_file": str(CLUSTER_NODES_FILE),
+        "cluster_topology_ok": cluster_topology_ok,
+        "provisioning_nodes_count": provisioning_nodes_count,
+        "disabled_nodes_count": disabled_nodes_count,
     }
 
 
@@ -777,6 +872,13 @@ def extension_audit():
             "in_use": sum(row["summary"]["in_use"] for row in groups),
             "error": sum(row["summary"]["error"] for row in groups),
             "group_mismatches": sum(row["summary"]["group_mismatches"] for row in groups),
+            "topology_incomplete": sum(row["summary"]["topology_incomplete"] for row in groups),
+            "expected_enabled_nodes": (
+                groups[0]["summary"]["expected_enabled_nodes"] if groups else 0
+            ),
+            "disabled_nodes": (
+                groups[0]["summary"]["disabled_nodes"] if groups else 0
+            ),
         },
     }
 
