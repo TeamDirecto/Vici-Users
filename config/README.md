@@ -131,3 +131,22 @@ Ejemplo para extensión 95217:
 ```
 
 Esta regla aplica sólo a altas nuevas administradas por Vici-Users.
+
+
+## Dry-run de provisión de phones
+
+Antes de cualquier escritura, el backend puede construir un plan de provisión
+para una extensión concreta. El dry-run:
+
+- valida que la extensión esté dentro del bloque del User Group;
+- confirma que la extensión objetivo no exista ya en `phones`;
+- calcula `login` y `dialplan_number` con la política canónica;
+- selecciona una extensión plantilla activa del mismo User Group y del mismo nodo;
+- valida `template_id` y que exista `conf_secret` sin devolver su valor;
+- busca colisiones de login/dialplan;
+- exige plantilla válida en los 4 nodos habilitados;
+- no ejecuta INSERT, UPDATE ni DELETE.
+
+Como `phones` y `vicidial_users` son MyISAM, el futuro motor de escritura no
+puede depender de ROLLBACK transaccional. El diseño usa compensación explícita
+y validación posterior.
