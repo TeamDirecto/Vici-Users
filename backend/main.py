@@ -49,6 +49,48 @@ CLUSTER_NODES_FILE = Path(
         str(APP_ROOT / "config" / "cluster_nodes.json"),
     )
 )
+USER_CLONE_FIELDS = [
+    "delete_users", "delete_user_groups", "delete_lists", "delete_campaigns",
+    "delete_ingroups", "delete_remote_agents", "load_leads", "campaign_detail",
+    "ast_admin_access", "ast_delete_phones", "delete_scripts", "modify_leads",
+    "hotkeys_active", "change_agent_campaign", "agent_choose_ingroups",
+    "closer_campaigns", "scheduled_callbacks", "agentonly_callbacks",
+    "agentcall_manual", "vicidial_recording", "vicidial_transfers",
+    "delete_filters", "alter_agent_interface_options", "closer_default_blended",
+    "delete_call_times", "modify_call_times", "modify_users", "modify_campaigns",
+    "modify_lists", "modify_scripts", "modify_filters", "modify_ingroups",
+    "modify_usergroups", "modify_remoteagents", "modify_servers", "view_reports",
+    "vicidial_recording_override", "alter_custdata_override", "qc_enabled",
+    "qc_user_level", "qc_pass", "qc_finish", "qc_commit", "add_timeclock_log",
+    "modify_timeclock_log", "delete_timeclock_log", "alter_custphone_override",
+    "vdc_agent_api_access", "modify_inbound_dids", "delete_inbound_dids",
+    "alert_enabled", "download_lists", "agent_shift_enforcement_override",
+    "manager_shift_enforcement_override", "shift_override_flag", "export_reports",
+    "delete_from_dnc", "allow_alerts", "agent_choose_territories",
+    "agent_call_log_view_override", "callcard_admin", "agent_choose_blended",
+    "realtime_block_user_info", "custom_fields_modify", "force_change_password",
+    "agent_lead_search_override", "modify_shifts", "modify_phones",
+    "modify_carriers", "modify_labels", "modify_statuses", "modify_voicemail",
+    "modify_audiostore", "modify_moh", "modify_tts", "preset_contact_search",
+    "modify_contacts", "modify_same_user_level", "admin_hide_lead_data",
+    "admin_hide_phone_data", "agentcall_email", "modify_email_accounts",
+    "alter_admin_interface_options", "max_inbound_calls",
+    "modify_custom_dialplans", "wrapup_seconds_override", "modify_languages",
+    "selected_language", "user_choose_language", "ignore_group_on_search",
+    "api_list_restrict", "api_allowed_functions", "lead_filter_id",
+    "admin_cf_show_hidden", "agentcall_chat", "user_hide_realtime",
+    "access_recordings", "modify_colors", "user_new_lead_limit", "api_only_user",
+    "modify_auto_reports", "modify_ip_lists", "ignore_ip_list",
+    "ready_max_logout", "export_gdpr_leads", "pause_code_approval",
+    "max_hopper_calls", "max_hopper_calls_hour", "mute_recordings",
+    "hide_call_log_info", "next_dial_my_callbacks", "user_admin_redirect_url",
+    "max_inbound_filter_enabled", "max_inbound_filter_statuses",
+    "max_inbound_filter_ingroups", "max_inbound_filter_min_sec",
+    "status_group_id", "two_factor_override", "manual_dial_filter",
+    "download_invalid_files", "user_group_two", "modify_dial_prefix",
+    "inbound_credits", "hci_enabled", "manual_dial_lead_id",
+]
+
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -58,7 +100,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.13.0-extension-allocation-preview")
+app = FastAPI(title="Vici-Users API", version="0.14.0-write-plan-dry-run")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -465,6 +507,326 @@ def phone_provisioning_dry_run(user_group, extension):
         "blockers": blockers,
         "warnings": warnings,
         "nodes": node_plans,
+    }
+
+
+def provisioning_write_plan(user_group, username, full_name, extension):
+    require_provisioning_group(user_group)
+    username = str(username or "").strip().upper()
+    full_name = str(full_name or "").strip()
+    extension_text = str(extension or "").strip()
+
+    blockers = []
+    warnings = []
+
+    if not username or len(username) > USERNAME_MAX_LENGTH:
+        blockers.append("INVALID_USERNAME_LENGTH")
+    elif not all(ch.isalnum() or ch == "_" for ch in username):
+        blockers.append("INVALID_USERNAME_CHARACTERS")
+
+    if not full_name:
+        blockers.append("FULL_NAME_REQUIRED")
+
+    phone_plan = phone_provisioning_dry_run(user_group, extension_text)
+    blockers.extend(phone_plan.get("blockers", []))
+    warnings.extend(phone_plan.get("warnings", []))
+
+    templates = load_group_templates()
+    template_user = templates.get(user_group)
+    if not template_user:
+        blockers.append("USER_TEMPLATE_NOT_CONFIGURED")
+
+    default_password_configured = user_group in load_group_defaults()
+    if not default_password_configured:
+        blockers.append("DEFAULT_PASSWORD_NOT_CONFIGURED")
+
+    identity = canonical_phone_plan(user_group, extension_text)
+    enabled_identity = dict(
+        (node["server_ip"], node)
+        for node in identity["nodes"]
+        if node["enabled"]
+    )
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT user, user_group, active FROM vicidial_users WHERE user=%s LIMIT 1",
+            (username,),
+        )
+        existing_user = cursor.fetchone()
+        if existing_user:
+            blockers.append("TARGET_USER_ALREADY_EXISTS")
+
+        source_user = None
+        if template_user:
+            cursor.execute(
+                """
+                SELECT user, user_group, user_level, active
+                  FROM vicidial_users
+                 WHERE user=%s
+                   AND user_group=%s
+                 LIMIT 1
+                """,
+                (template_user, user_group),
+            )
+            source_user = cursor.fetchone()
+            if not source_user:
+                blockers.append("USER_TEMPLATE_ROW_MISSING")
+
+        cursor.execute("SHOW COLUMNS FROM vicidial_users")
+        user_schema = set(row["Field"] for row in cursor.fetchall())
+        missing_user_fields = [
+            field for field in USER_CLONE_FIELDS if field not in user_schema
+        ]
+        if missing_user_fields:
+            blockers.append("USER_SCHEMA_ALLOWLIST_MISMATCH")
+
+        cursor.execute("SHOW COLUMNS FROM phones")
+        phone_columns = [row["Field"] for row in cursor.fetchall()]
+
+        phone_nodes = []
+        phone_override_fields = {
+            "extension",
+            "dialplan_number",
+            "voicemail_id",
+            "server_ip",
+            "login",
+            "pass",
+            "active",
+            "user_group",
+        }
+
+        source_by_server = dict(
+            (row["server_ip"], row)
+            for row in phone_plan.get("nodes", [])
+            if row.get("enabled")
+        )
+
+        for server_ip, target in enabled_identity.items():
+            source_meta = source_by_server.get(server_ip) or {}
+            source_extension = source_meta.get("template_source_extension")
+            source_row = None
+
+            if source_extension:
+                cursor.execute(
+                    """
+                    SELECT *
+                      FROM phones
+                     WHERE extension=%s
+                       AND server_ip=%s
+                     LIMIT 1
+                    """,
+                    (source_extension, server_ip),
+                )
+                source_row = cursor.fetchone()
+
+            if not source_row:
+                blockers.append("PHONE_TEMPLATE_ROW_MISSING:%s" % server_ip)
+                phone_nodes.append({
+                    "server_ip": server_ip,
+                    "status": "BLOCKED",
+                    "source_extension": source_extension,
+                    "target_extension": extension_text,
+                })
+                continue
+
+            unmapped_references = []
+            source_extension_text = str(source_extension)
+            for field, value in source_row.items():
+                if field in phone_override_fields or value is None:
+                    continue
+                value_text = str(value)
+                if source_extension_text and source_extension_text in value_text:
+                    unmapped_references.append(field)
+
+            if unmapped_references:
+                for field in unmapped_references:
+                    blockers.append(
+                        "UNMAPPED_PHONE_TEMPLATE_REFERENCE:%s:%s"
+                        % (server_ip, field)
+                    )
+
+            override_values = {
+                "extension": extension_text,
+                "dialplan_number": target["dialplan_number"],
+                "voicemail_id": extension_text,
+                "server_ip": server_ip,
+                "login": target["login"],
+                "pass": extension_text,
+                "active": "N",
+                "user_group": user_group,
+            }
+
+            select_parts = []
+            safe_parameters = []
+            for field in phone_columns:
+                if field in override_values:
+                    select_parts.append("%s AS `%s`" % ("%s", field))
+                    safe_parameters.append({
+                        "field": field,
+                        "value": override_values[field],
+                    })
+                else:
+                    select_parts.append("`%s`" % field)
+
+            columns_sql = ", ".join("`%s`" % field for field in phone_columns)
+            select_sql = ", ".join(select_parts)
+            insert_sql = (
+                "INSERT INTO phones (%s) "
+                "SELECT %s FROM phones "
+                "WHERE extension=%%s AND server_ip=%%s LIMIT 1"
+                % (columns_sql, select_sql)
+            )
+
+            safe_parameters.append({
+                "field": "source_extension",
+                "value": source_extension_text,
+            })
+            safe_parameters.append({
+                "field": "source_server_ip",
+                "value": server_ip,
+            })
+
+            phone_nodes.append({
+                "server_ip": server_ip,
+                "status": "READY" if not unmapped_references else "REVIEW",
+                "source_extension": source_extension_text,
+                "target_extension": extension_text,
+                "changed_fields": [
+                    {"field": "extension", "from": source_extension_text, "to": extension_text},
+                    {"field": "dialplan_number", "from": str(source_row.get("dialplan_number") or ""), "to": target["dialplan_number"]},
+                    {"field": "voicemail_id", "from": str(source_row.get("voicemail_id") or ""), "to": extension_text},
+                    {"field": "server_ip", "from": str(source_row.get("server_ip") or ""), "to": server_ip},
+                    {"field": "login", "from": str(source_row.get("login") or ""), "to": target["login"]},
+                    {"field": "pass", "from": "<SOURCE_PHONE_PASS>", "to": "<TARGET_EXTENSION>"},
+                    {"field": "active", "from": str(source_row.get("active") or ""), "to": "N"},
+                    {"field": "user_group", "from": str(source_row.get("user_group") or ""), "to": user_group},
+                ],
+                "copied_fields_count": len(phone_columns) - len(phone_override_fields),
+                "conf_secret_strategy": "COPY_FROM_NODE_TEMPLATE",
+                "unmapped_source_extension_references": unmapped_references,
+                "sql_template": insert_sql,
+                "safe_parameters_in_order": safe_parameters,
+            })
+
+    user_columns = [
+        "user", "pass", "full_name", "user_level", "user_group", "active"
+    ] + list(USER_CLONE_FIELDS)
+    user_columns_sql = ", ".join("`%s`" % field for field in user_columns)
+    user_select_sql = ", ".join(
+        ["%s", "%s", "%s", "%s", "%s", "%s"]
+        + ["`%s`" % field for field in USER_CLONE_FIELDS]
+    )
+    user_insert_sql = (
+        "INSERT INTO vicidial_users (%s) "
+        "SELECT %s FROM vicidial_users "
+        "WHERE user=%%s AND user_group=%%s LIMIT 1"
+        % (user_columns_sql, user_select_sql)
+    )
+
+    unique_blockers = []
+    seen_blockers = set()
+    for blocker in blockers:
+        if blocker not in seen_blockers:
+            unique_blockers.append(blocker)
+            seen_blockers.add(blocker)
+
+    unique_warnings = []
+    seen_warnings = set()
+    for warning in warnings:
+        if warning not in seen_warnings:
+            unique_warnings.append(warning)
+            seen_warnings.add(warning)
+
+    status = "READY" if not unique_blockers else "BLOCKED"
+
+    enabled_servers = [
+        node["server_ip"]
+        for node in phone_nodes
+        if node.get("status") in {"READY", "REVIEW"}
+    ]
+    server_placeholders = ",".join(["%s"] * len(enabled_servers)) if enabled_servers else "%s"
+    activate_phones_sql = (
+        "UPDATE phones SET active='Y' "
+        "WHERE extension=%s AND user_group=%s "
+        "AND server_ip IN (%s)" % ("%s", "%s", server_placeholders)
+    )
+    rollback_phones_sql = (
+        "DELETE FROM phones "
+        "WHERE extension=%s AND user_group=%s "
+        "AND server_ip IN (%s)" % ("%s", "%s", server_placeholders)
+    )
+
+    return {
+        "mode": "DRY_RUN_WRITE_PLAN",
+        "write_performed": False,
+        "create_enabled": CREATE_ENABLED,
+        "status": status,
+        "user_group": user_group,
+        "username": username,
+        "full_name": full_name,
+        "extension": extension_text,
+        "storage_engines": {
+            "phones": "MyISAM",
+            "vicidial_users": "MyISAM",
+        },
+        "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
+        "user_plan": {
+            "source_user": template_user,
+            "target_user": username,
+            "clone_fields_count": len(USER_CLONE_FIELDS),
+            "identity_overrides": {
+                "user": username,
+                "pass": "<SERVER_SIDE_GROUP_PASSWORD>",
+                "full_name": full_name,
+                "user_level": 1,
+                "user_group": user_group,
+                "active": "N",
+            },
+            "sql_template": user_insert_sql,
+            "safe_parameters_in_order": [
+                username,
+                "<SERVER_SIDE_GROUP_PASSWORD>",
+                full_name,
+                1,
+                user_group,
+                "N",
+                template_user,
+                user_group,
+            ],
+            "final_activation_sql": (
+                "UPDATE vicidial_users SET active='Y' "
+                "WHERE user=%s AND user_group=%s"
+            ),
+        },
+        "phones_plan": phone_nodes,
+        "operation_order": [
+            "REVALIDATE_TARGET_USER_AND_EXTENSION",
+            "RESERVE_EXTENSION_IN_LOCAL_INVENTORY",
+            "INSERT_REQUIRED_PHONES_AS_ACTIVE_N",
+            "VALIDATE_REQUIRED_PHONES",
+            "INSERT_USER_AS_ACTIVE_N",
+            "VALIDATE_USER",
+            "ACTIVATE_REQUIRED_PHONES",
+            "ACTIVATE_USER",
+            "VALIDATE_FINAL_USER_AND_PHONES",
+            "MARK_EXTENSION_IN_USE",
+        ],
+        "activation_sql": {
+            "phones": activate_phones_sql,
+            "user": (
+                "UPDATE vicidial_users SET active='Y' "
+                "WHERE user=%s AND user_group=%s"
+            ),
+        },
+        "compensation_sql": {
+            "phones": rollback_phones_sql,
+            "user": (
+                "DELETE FROM vicidial_users "
+                "WHERE user=%s AND user_group=%s"
+            ),
+        },
+        "blockers": unique_blockers,
+        "warnings": unique_warnings,
     }
 
 
@@ -1077,6 +1439,13 @@ class CreateRequest(PreviewRequest):
     agent_pass: Optional[str] = Field(None, min_length=1, max_length=100)
 
 
+class WritePlanRequest(BaseModel):
+    user_group: str = Field(..., min_length=1, max_length=20)
+    username: str = Field(..., min_length=1, max_length=20)
+    full_name: str = Field(..., min_length=1, max_length=50)
+    extension: str = Field(..., min_length=1, max_length=20)
+
+
 @app.get("/api/health")
 def health():
     db_ok = False
@@ -1484,6 +1853,16 @@ def preview_users(payload: PreviewRequest):
         "conflicts": sum(1 for row in results if row["status"] != "AVAILABLE"),
         "users": results,
     }
+
+
+@app.post("/api/provisioning/write-plan")
+def provisioning_write_plan_route(payload: WritePlanRequest):
+    return provisioning_write_plan(
+        payload.user_group,
+        payload.username,
+        payload.full_name,
+        payload.extension,
+    )
 
 
 @app.post("/api/users/create")
