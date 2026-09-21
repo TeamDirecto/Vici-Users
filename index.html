@@ -80,14 +80,14 @@
       <section class="stats">
         <div class="stat"><small>Grupos auditados</small><strong id="auditGroups">0</strong></div>
         <div class="stat"><small>Legacy</small><strong id="auditLegacy">0</strong></div>
-        <div class="stat"><small>Sin crear</small><strong id="auditUncreated">0</strong></div>
+        <div class="stat"><small>Incompletas</small><strong id="auditIncomplete">0</strong></div>
         <div class="stat"><small>Desalineadas</small><strong id="auditMismatch">0</strong></div>
       </section>
       <section class="card">
-        <div class="head"><div><h2>Inventario por User Group</h2><p>Lectura segura de los 18 bloques configurados. No modifica VICIdial.</p></div><button class="btn secondary" id="refreshAudit" type="button">↻ Actualizar</button></div>
+        <div class="head"><div><h2>Inventario por User Group</h2><p id="auditTopologyText">Lectura segura de los 18 bloques configurados. No modifica VICIdial.</p></div><button class="btn secondary" id="refreshAudit" type="button">↻ Actualizar</button></div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>User Group</th><th>Bloque</th><th>Legacy</th><th>Free</th><th>Sin crear</th><th>Desalineadas</th><th>Siguiente candidata</th></tr></thead>
+            <thead><tr><th>User Group</th><th>Bloque</th><th>Legacy</th><th>Free</th><th>Sin crear</th><th>Incompletas</th><th>Desalineadas</th><th>Siguiente candidata</th></tr></thead>
             <tbody id="auditRows"></tbody>
           </table>
         </div>
@@ -150,17 +150,19 @@
   }
 
   async function loadAudit(){
-    $('auditRows').innerHTML='<tr><td colspan="7">Consultando inventario…</td></tr>';
+    $('auditRows').innerHTML='<tr><td colspan="8">Consultando inventario…</td></tr>';
     try{
       const data=await api('/extensions/audit');const t=data.totals||{};
-      $('auditGroups').textContent=t.groups||0;$('auditLegacy').textContent=t.legacy||0;$('auditUncreated').textContent=t.uncreated||0;$('auditMismatch').textContent=t.group_mismatches||0;
+      $('auditGroups').textContent=t.groups||0;$('auditLegacy').textContent=t.legacy||0;$('auditIncomplete').textContent=t.topology_incomplete||0;$('auditMismatch').textContent=t.group_mismatches||0;
+      $('auditTopologyText').textContent='Topología efectiva: '+(t.expected_enabled_nodes||0)+' nodo(s) obligatorios · '+(t.disabled_nodes||0)+' excluido(s) temporalmente. Sólo lectura.';
       $('auditRows').innerHTML=(data.groups||[]).map(row=>{
         const s=row.summary||{},r=row.extension_range||{};
         const mismatch=s.group_mismatches?'<span class="badge red">'+s.group_mismatches+'</span>':'<span class="badge green">0</span>';
         const next=s.next_candidate?'<code>'+escapeHtml(s.next_candidate)+'</code> <span class="badge gray">'+escapeHtml(s.next_candidate_source||'')+'</span>':'—';
-        return '<tr><td><strong>'+escapeHtml(row.user_group)+'</strong></td><td><code>'+escapeHtml(r.start)+'–'+escapeHtml(r.end)+'</code></td><td>'+escapeHtml(s.legacy||0)+'</td><td>'+escapeHtml(s.free||0)+'</td><td>'+escapeHtml(s.uncreated||0)+'</td><td>'+mismatch+'</td><td>'+next+'</td></tr>';
+        const incomplete=s.topology_incomplete?'<span class="badge amber">'+s.topology_incomplete+'</span>':'<span class="badge green">0</span>';
+        return '<tr><td><strong>'+escapeHtml(row.user_group)+'</strong></td><td><code>'+escapeHtml(r.start)+'–'+escapeHtml(r.end)+'</code></td><td>'+escapeHtml(s.legacy||0)+'</td><td>'+escapeHtml(s.free||0)+'</td><td>'+escapeHtml(s.uncreated||0)+'</td><td>'+incomplete+'</td><td>'+mismatch+'</td><td>'+next+'</td></tr>';
       }).join('');
-    }catch(error){$('auditRows').innerHTML='<tr><td colspan="7"><span class="badge red">Error</span> '+escapeHtml(error.message)+'</td></tr>';toast(error.message)}
+    }catch(error){$('auditRows').innerHTML='<tr><td colspan="8"><span class="badge red">Error</span> '+escapeHtml(error.message)+'</td></tr>';toast(error.message)}
   }
 
   function peopleFromText(){return $('bulkText').value.split(/\n+/).map(x=>x.trim()).filter(Boolean).map(line=>{const p=line.split(',').map(x=>x.trim());return{first_names:p[0]||'',paternal:p[1]||'',maternal:p[2]||''}}).filter(p=>p.first_names||p.paternal||p.maternal)}
