@@ -58,7 +58,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.12.0-phone-dry-run")
+app = FastAPI(title="Vici-Users API", version="0.13.0-extension-allocation-preview")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -465,6 +465,235 @@ def phone_provisioning_dry_run(user_group, extension):
         "blockers": blockers,
         "warnings": warnings,
         "nodes": node_plans,
+    }
+
+
+def extension_candidate_pool(user_group):
+    extension_range = require_provisioning_group(user_group)
+    topology = load_cluster_nodes()
+    enabled_servers = set(
+        node["server_ip"] for node in topology["nodes"] if node["enabled"]
+    )
+    extensions = [
+        str(value)
+        for value in range(extension_range["start"], extension_range["end"] + 1)
+    ]
+    placeholders = ",".join(["%s"] * len(extensions))
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT extension, server_ip, active, user_group
+              FROM phones
+             WHERE extension IN (%s)
+             ORDER BY extension, server_ip
+            """ % placeholders,
+            tuple(extensions),
+        )
+        phone_rows = cursor.fetchall()
+
+    phones_by_extension = dict((extension, []) for extension in extensions)
+    for row in phone_rows:
+        extension = str(row.get("extension") or "")
+        if extension in phones_by_extension:
+            phones_by_extension[extension].append(row)
+
+    local_inventory = load_local_inventory(user_group)
+    free_candidates = []
+    uncreated_candidates = []
+
+    for extension in extensions:
+        rows = phones_by_extension.get(extension, [])
+        tracked = local_inventory.get(extension)
+
+        if tracked:
+            status = str(tracked.get("status") or "").upper()
+            released_at = tracked.get("released_at")
+            if status != "FREE" or not released_at or not rows:
+                continue
+
+            servers = set(
+                str(row.get("server_ip") or "").strip()
+                for row in rows
+                if str(row.get("server_ip") or "").strip()
+            )
+            groups_aligned = all(
+                str(row.get("user_group") or "").strip() == user_group
+                for row in rows
+            )
+            if enabled_servers.issubset(servers) and groups_aligned:
+                free_candidates.append({
+                    "extension": extension,
+                    "source": "FREE",
+                    "action": "REUSE_EXISTING",
+                    "released_at": str(released_at),
+                })
+            continue
+
+        if not rows:
+            uncreated_candidates.append({
+                "extension": extension,
+                "source": "UNCREATED",
+                "action": "CREATE_PHONES",
+                "released_at": None,
+            })
+
+    free_candidates.sort(
+        key=lambda row: (row["released_at"], int(row["extension"]))
+    )
+    uncreated_candidates.sort(key=lambda row: int(row["extension"]))
+    return free_candidates + uncreated_candidates
+
+
+def preview_extension_allocations(user_group, requested):
+    requested = int(requested)
+    if requested <= 0:
+        return {
+            "requested": 0,
+            "allocated": 0,
+            "candidates_considered": 0,
+            "allocations": [],
+            "rejected": [],
+        }
+
+    candidates = extension_candidate_pool(user_group)
+    topology = load_cluster_nodes()
+    enabled_nodes = [node for node in topology["nodes"] if node["enabled"]]
+    extension_range = require_provisioning_group(user_group)
+    range_start = str(extension_range["start"])
+    range_end = str(extension_range["end"])
+
+    template_sources = {}
+    with db_cursor() as cursor:
+        for node in enabled_nodes:
+            cursor.execute(
+                """
+                SELECT extension, server_ip, protocol, template_id,
+                       ext_context, phone_context, is_webphone,
+                       LENGTH(conf_secret) AS conf_secret_len
+                  FROM phones
+                 WHERE user_group=%s
+                   AND server_ip=%s
+                   AND active='Y'
+                   AND extension >= %s
+                   AND extension <= %s
+                 ORDER BY extension
+                 LIMIT 1
+                """,
+                (
+                    user_group,
+                    node["server_ip"],
+                    range_start,
+                    range_end,
+                ),
+            )
+            source = cursor.fetchone()
+            template_sources[node["server_ip"]] = source
+
+        uncreated = [row for row in candidates if row["source"] == "UNCREATED"]
+        target_logins = []
+        target_dialplans = []
+        plans = {}
+
+        for candidate in uncreated:
+            plan = canonical_phone_plan(user_group, candidate["extension"])
+            plans[candidate["extension"]] = plan
+            for node in plan["nodes"]:
+                if node["enabled"]:
+                    target_logins.append(node["login"])
+                    target_dialplans.append(node["dialplan_number"])
+
+        login_collisions = set()
+        if target_logins:
+            placeholders = ",".join(["%s"] * len(target_logins))
+            cursor.execute(
+                "SELECT login FROM phones WHERE login IN (%s)" % placeholders,
+                tuple(target_logins),
+            )
+            login_collisions = set(
+                str(row.get("login") or "") for row in cursor.fetchall()
+            )
+
+        dialplan_collisions = set()
+        if target_dialplans:
+            placeholders = ",".join(["%s"] * len(target_dialplans))
+            cursor.execute(
+                "SELECT dialplan_number FROM phones "
+                "WHERE dialplan_number IN (%s)" % placeholders,
+                tuple(target_dialplans),
+            )
+            dialplan_collisions = set(
+                str(row.get("dialplan_number") or "") for row in cursor.fetchall()
+            )
+
+    templates_ready = all(
+        source
+        and source.get("template_id")
+        and int(source.get("conf_secret_len") or 0) > 0
+        for source in template_sources.values()
+    )
+
+    allocations = []
+    rejected = []
+
+    for candidate in candidates:
+        if len(allocations) >= requested:
+            break
+
+        extension = candidate["extension"]
+        if candidate["source"] == "FREE":
+            allocations.append({
+                "extension": extension,
+                "source": "FREE",
+                "action": "REUSE_EXISTING",
+                "status": "READY",
+                "released_at": candidate["released_at"],
+            })
+            continue
+
+        plan = plans.get(extension)
+        reasons = []
+
+        if not templates_ready:
+            reasons.append("NODE_TEMPLATE_MISSING_OR_INVALID")
+
+        if plan:
+            enabled_plan_nodes = [node for node in plan["nodes"] if node["enabled"]]
+            if any(node["login"] in login_collisions for node in enabled_plan_nodes):
+                reasons.append("TARGET_LOGIN_COLLISION")
+            if any(
+                node["dialplan_number"] in dialplan_collisions
+                for node in enabled_plan_nodes
+            ):
+                reasons.append("TARGET_DIALPLAN_COLLISION")
+
+        if reasons:
+            rejected.append({
+                "extension": extension,
+                "source": "UNCREATED",
+                "status": "BLOCKED",
+                "reasons": reasons,
+            })
+            continue
+
+        allocations.append({
+            "extension": extension,
+            "source": "UNCREATED",
+            "action": "CREATE_PHONES",
+            "status": "READY",
+            "identity_policy": (
+                plan["identity_policy"] if plan else topology["identity_policy"]
+            ),
+        })
+
+    return {
+        "requested": requested,
+        "allocated": len(allocations),
+        "candidates_considered": len(candidates),
+        "templates_ready": templates_ready,
+        "required_nodes": len(enabled_nodes),
+        "allocations": allocations,
+        "rejected": rejected,
     }
 
 
@@ -1205,13 +1434,53 @@ def preview_users(payload: PreviewRequest):
             "attempts": attempts,
         })
 
+    available_rows = [row for row in results if row["status"] == "AVAILABLE"]
+    extension_preview = preview_extension_allocations(
+        payload.user_group,
+        len(available_rows),
+    )
+    allocations = list(extension_preview["allocations"])
+
+    allocation_index = 0
+    for row in results:
+        if row["status"] != "AVAILABLE":
+            row["extension"] = None
+            row["extension_source"] = None
+            row["extension_action"] = None
+            continue
+
+        if allocation_index >= len(allocations):
+            row["status"] = "CONFLICT"
+            row["reason"] = "NO_AVAILABLE_EXTENSION"
+            row["extension"] = None
+            row["extension_source"] = None
+            row["extension_action"] = None
+            continue
+
+        allocation = allocations[allocation_index]
+        allocation_index += 1
+        row["extension"] = allocation["extension"]
+        row["extension_source"] = allocation["source"]
+        row["extension_action"] = allocation["action"]
+
     return {
         "template": template,
         "default_password_configured": payload.user_group in load_group_defaults(),
         "extension_range": extension_range,
+        "extension_allocation": {
+            "requested": extension_preview["requested"],
+            "allocated": extension_preview["allocated"],
+            "candidates_considered": extension_preview["candidates_considered"],
+            "templates_ready": extension_preview.get("templates_ready", False),
+            "required_nodes": extension_preview.get("required_nodes", 0),
+            "rejected": extension_preview["rejected"],
+        },
         "requested": len(payload.people),
         "available": sum(1 for row in results if row["status"] == "AVAILABLE"),
-        "resolved": sum(1 for row in results if row.get("resolved")),
+        "resolved": sum(
+            1 for row in results
+            if row["status"] == "AVAILABLE" and row.get("resolved")
+        ),
         "conflicts": sum(1 for row in results if row["status"] != "AVAILABLE"),
         "users": results,
     }
