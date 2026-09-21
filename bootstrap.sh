@@ -9,6 +9,8 @@ ASTGUI_CONF="/etc/astguiclient.conf"
 DB_HOST="172.20.20.198"
 DB_NAME="asterisk"
 PORT="8094"
+INVENTORY_DIR="/var/lib/vici-users"
+INVENTORY_DB="${INVENTORY_DIR}/extension_inventory.db"
 SERVICE_NAME="vici-users.service"
 SERVICE_DST="/etc/systemd/system/${SERVICE_NAME}"
 ENV_DST="/etc/sysconfig/vici-users"
@@ -166,6 +168,7 @@ VICI_DB_EXPECTED_HOST=${DB_HOST}
 VICI_DB_NAME=${DB_NAME}
 VICI_USERS_ENABLE_CREATE=false
 VICI_USERS_USERNAME_MAX_LENGTH=20
+VICI_USERS_INVENTORY_DB=/tmp/vici-users-extension-inventory.db
 EOF
 
 if [ "$PORT_BUSY_BY_SERVICE" -eq 0 ]; then
@@ -208,7 +211,10 @@ assert h.get('db_host') == '172.20.20.198', 'db_host inesperado'
 assert h.get('db_node') == 'vici222', 'db_node inesperado: %r' % (h.get('db_node'),)
 assert h.get('db_name') == 'asterisk', 'db_name inesperado'
 assert h.get('create_enabled') is False, 'CREATE debe permanecer deshabilitado en CP1'
-print('Health validado: vici97 -> vici222/asterisk, CREATE=false')
+assert h.get('extension_ranges_ok') is True, 'Rangos de extensiones inválidos'
+assert h.get('extension_ranges_count') == 18, 'Se esperaban 18 bloques de extensiones'
+assert h.get('inventory_db_ok') is True, 'Inventario local no disponible'
+print('Health validado: vici97 -> vici222/asterisk, 18 rangos, inventario OK, CREATE=false')
 PY
 
   log "Probando lectura de User Groups"
@@ -254,7 +260,9 @@ VICI_DB_EXPECTED_HOST=${DB_HOST}
 VICI_DB_NAME=${DB_NAME}
 VICI_USERS_ENABLE_CREATE=false
 VICI_USERS_USERNAME_MAX_LENGTH=20
+VICI_USERS_INVENTORY_DB=${INVENTORY_DB}
 EOF
+  install -d -m 0700 "$INVENTORY_DIR"
   chmod 0644 "$ENV_DST"
   systemctl daemon-reload
   ok "Servicio instalado. CREATE permanece en false."
