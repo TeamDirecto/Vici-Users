@@ -53,9 +53,9 @@
             <div class="hint">Si queda vacío, el backend usará el default del grupo. El valor default nunca se envía al navegador ni se almacena en GitHub.</div>
           </div>
           <div class="field">
-            <label>Extensión</label>
-            <input id="extensionRule" type="text" value="Pendiente de definir regla de numeración" disabled />
-            <div class="hint">CP2 quedará preparado para crear <strong>usuario + extensión</strong> como una sola operación. No se asignará ninguna extensión hasta definir rango y lógica.</div>
+            <label>Bloque de extensiones</label>
+            <input id="extensionRule" type="text" value="Selecciona un User Group" disabled />
+            <div class="hint">El backend controla el bloque permitido. La asignación automática y el reciclaje todavía permanecen deshabilitados.</div>
           </div>
           <div class="field"><label>Personas</label><textarea id="bulkText" placeholder="Juan Carlos,Pérez,López&#10;María Fernanda,Hernández,Soto&#10;Luis,Gómez,Ruiz"></textarea><div class="hint">Una persona por línea: <strong>Nombre(s), Apellido paterno, Apellido materno</strong>.</div></div>
           <div class="rule"><strong>Regla EHECTO</strong><br>Primera letra del apellido paterno + primer nombre. Si existe, amplía el apellido: <code>PJUAN → PEJUAN → PERJUAN…</code>.<br><br><strong>CP2:</strong> el alta sólo se considerará completa cuando existan tanto el usuario VICIdial como su extensión.</div>
@@ -64,12 +64,12 @@
       </div>
 
       <div class="card">
-        <div class="head"><div><h2>Previsualización</h2><p>vici97 valida username, BASE_* y password default. La extensión se habilitará al definir su regla.</p></div><span class="step">Paso 2</span></div>
-        <div id="empty" class="empty"><strong>Aún no hay altas para revisar</strong><p>Selecciona un grupo con BASE_* y valida el lote. La extensión aparecerá como pendiente hasta definir la numeración.</p></div>
+        <div class="head"><div><h2>Previsualización</h2><p>vici97 valida username, BASE_*, password default y bloque de extensión.</p></div><span class="step">Paso 2</span></div>
+        <div id="empty" class="empty"><strong>Aún no hay altas para revisar</strong><p>Selecciona un grupo habilitado y valida el lote.</p></div>
         <div id="preview" class="hidden">
           <div class="toolbar"><strong id="previewSummary">0 registros</strong><span id="templateBadge" class="badge gray">Plantilla —</span></div>
           <div class="table-wrap"><table><thead><tr><th>Persona</th><th>Inicial</th><th>Username final</th><th>Extensión</th><th>Resultado</th><th>Intentos</th></tr></thead><tbody id="rows"></tbody></table></div>
-          <div class="footer"><small id="createNote">CP1 validado. CP2 usuario + extensión pendiente de regla de numeración.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuario + extensión</button></div></div>
+          <div class="footer"><small id="createNote">CP1 validado. Rangos cargados; escritura todavía deshabilitada.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuario + extensión</button></div></div>
         </div>
       </div>
     </section>
@@ -84,30 +84,23 @@
   let selectedTemplate = null;
   let previewPayload = null;
 
-  // Grupos temporalmente fuera del flujo de alta.
-  // Se mantienen en backend/configuración para poder reactivarlos después.
-  const DISABLED_PROVISIONING_GROUPS = new Set([
-    'CC-CORTIZO-4PV',
-    'CC-CORTIZO-MOROSO'
-  ]);
-
   const $ = id => document.getElementById(id);
   const escapeHtml = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
   function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').classList.remove('show'),3200)}
   async function api(path, options={}){const response=await fetch(API+path,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);return data}
   function setConnection(ok,text){$('serverDot').className='dot '+(ok?'ok':'bad');$('topDot').className='dot '+(ok?'ok':'bad');$('connectionText').textContent=text;$('serverText').textContent=ok?'API vici97 activa y vici222 accesible.':'Sin conexión con backend o DB central.'}
-  function resetTemplate(group='—'){$('tplUser').textContent='—';$('tplLevel').textContent='—';$('tplGroup').textContent=group||'—';$('tplName').textContent='—';$('passDefaultStatus').textContent='—';selectedTemplate=null;$('previewBtn').disabled=true}
+  function resetTemplate(group='—'){$('tplUser').textContent='—';$('tplLevel').textContent='—';$('tplGroup').textContent=group||'—';$('tplName').textContent='—';$('passDefaultStatus').textContent='—';$('extensionRule').value=group?'Consultando bloque…':'Selecciona un User Group';selectedTemplate=null;$('previewBtn').disabled=true}
 
   async function boot(){
     try{
       apiHealth=await api('/health');if(!apiHealth.db_ok)throw new Error('Backend activo, pero no hay conexión con vici222.');
-      setConnection(true,`${apiHealth.app_node} → ${apiHealth.db_node||'vici222'} · conectado`);$('connectionError').classList.add('hidden');await loadGroups();$('createBtn').disabled=!apiHealth.create_enabled;$('createNote').textContent=apiHealth.create_enabled?'Backend en modo creación; extensión aún requiere regla de numeración.':'CP1 validado: escritura deshabilitada. CP2 será usuario + extensión.';
+      setConnection(true,`${apiHealth.app_node} → ${apiHealth.db_node||'vici222'} · conectado`);$('connectionError').classList.add('hidden');await loadGroups();$('createBtn').disabled=!apiHealth.create_enabled;$('createNote').textContent=apiHealth.create_enabled?'Backend en modo creación; motor de extensiones aún protegido.':`CP1 validado: ${apiHealth.extension_ranges_count||0} bloques cargados; escritura deshabilitada.`;
     }catch(error){setConnection(false,'Sin conexión');$('connectionError').textContent=error.message;$('connectionError').classList.remove('hidden');$('userGroup').innerHTML='<option>No disponible</option>'}
   }
 
   async function loadGroups(){
     const data=await api('/groups');const select=$('userGroup');
-    const availableGroups=data.groups.filter(g=>!DISABLED_PROVISIONING_GROUPS.has(g.user_group));
+    const availableGroups=data.groups.filter(g=>g.provisioning_enabled);
     select.innerHTML='<option value="">Selecciona un User Group</option>'+availableGroups.map(g=>{
       const flags=[];if(!g.template_configured)flags.push('SIN PLANTILLA');if(!g.default_password_configured)flags.push('SIN PASSWORD DEFAULT');
       return `<option value="${escapeHtml(g.user_group)}">${escapeHtml(g.user_group)}${g.group_name?' · '+escapeHtml(g.group_name):''}${flags.length?' · '+flags.join(' / '):''}</option>`
@@ -118,6 +111,7 @@
     const group=$('userGroup').value;resetTemplate(group);$('templateWarning').classList.add('hidden');if(!group)return;
     try{
       const data=await api(`/groups/${encodeURIComponent(group)}/template`);$('passDefaultStatus').textContent=data.default_password_configured?'Configurado':'No configurado';
+      if(data.extension_range){$('extensionRule').value=`${data.extension_range.start} – ${data.extension_range.end} (${data.extension_range.capacity} posiciones)`}else{$('extensionRule').value='Sin bloque configurado'}
       if(!data.configured){$('templateWarning').textContent=`El grupo ${group} todavía no tiene usuario base configurado en vici97.`;$('templateWarning').classList.remove('hidden');return}
       selectedTemplate=data.template;$('tplUser').textContent=selectedTemplate.user;$('tplLevel').textContent=selectedTemplate.user_level;$('tplGroup').textContent=selectedTemplate.user_group;$('tplName').textContent=selectedTemplate.full_name||'—';$('previewBtn').disabled=false;
     }catch(error){$('templateWarning').textContent=error.message;$('templateWarning').classList.remove('hidden');toast(error.message)}
@@ -133,13 +127,14 @@
 
   function renderPreview(data){
     $('statTotal').textContent=data.requested;$('statAvailable').textContent=data.available;$('statResolved').textContent=data.resolved;$('statConflict').textContent=data.conflicts;$('previewSummary').textContent=`${data.requested} registro${data.requested===1?'':'s'}`;$('templateBadge').textContent=`Plantilla ${data.template.user}`;
-    $('rows').innerHTML=data.users.map(u=>{const status=u.status==='AVAILABLE'?(u.resolved?'<span class="badge amber">Colisión resuelta</span>':'<span class="badge green">Disponible</span>'):'<span class="badge red">Conflicto</span>';const person=`${u.first_names} ${u.paternal} ${u.maternal||''}`.trim();return `<tr><td><strong>${escapeHtml(person)}</strong></td><td><code>${escapeHtml(u.initial||'—')}</code></td><td><code>${escapeHtml(u.username||'—')}</code></td><td><span class="badge gray">Pendiente regla</span></td><td>${status}</td><td>${escapeHtml((u.attempts||[]).join(' → ')||u.reason||'—')}</td></tr>`}).join('');$('empty').classList.add('hidden');$('preview').classList.remove('hidden')
+    const range=data.extension_range;const rangeText=range?`${range.start}–${range.end}`:'—';
+    $('rows').innerHTML=data.users.map(u=>{const status=u.status==='AVAILABLE'?(u.resolved?'<span class="badge amber">Colisión resuelta</span>':'<span class="badge green">Disponible</span>'):'<span class="badge red">Conflicto</span>';const person=`${u.first_names} ${u.paternal} ${u.maternal||''}`.trim();return `<tr><td><strong>${escapeHtml(person)}</strong></td><td><code>${escapeHtml(u.initial||'—')}</code></td><td><code>${escapeHtml(u.username||'—')}</code></td><td><span class="badge gray">Pool ${escapeHtml(rangeText)}</span></td><td>${status}</td><td>${escapeHtml((u.attempts||[]).join(' → ')||u.reason||'—')}</td></tr>`}).join('');$('empty').classList.add('hidden');$('preview').classList.remove('hidden')
   }
 
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
   $('togglePass').addEventListener('click',()=>{const f=$('agentPass');const show=f.type==='password';f.type=show?'text':'password';$('togglePass').textContent=show?'Ocultar':'Mostrar'});
   $('demoBtn').addEventListener('click',()=>{$('bulkText').value='Juan Carlos,Pérez,López\nMaría Fernanda,Hernández,Ruiz\nKristian Michell,Maya,Guzmán\nJosé Luis,Hernández,Soto';toast('Ejemplo cargado. Selecciona un grupo con plantilla configurada.')});
-  $('createBtn').addEventListener('click',()=>{toast('CP2 todavía no se habilita: falta definir la regla/rango de extensiones. No se escribió nada.')});
+  $('createBtn').addEventListener('click',()=>{toast('Los bloques ya están configurados. La asignación/reciclaje todavía está protegida y no se escribió nada.')});
   boot();
 </script>
 </body>
