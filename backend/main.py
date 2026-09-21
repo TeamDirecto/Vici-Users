@@ -58,7 +58,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.11.0-canonical-phone-plan")
+app = FastAPI(title="Vici-Users API", version="0.12.0-phone-dry-run")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -251,6 +251,7 @@ def load_cluster_nodes():
 
     return {
         "cluster": str(data.get("cluster") or "EHECTO"),
+        "identity_policy": str(data.get("identity_policy") or "canonical-v1"),
         "nodes": nodes,
     }
 
@@ -289,6 +290,181 @@ def canonical_phone_plan(user_group, extension):
         "identity_policy": topology.get("identity_policy", "canonical-v1"),
         "required_nodes": sum(1 for node in nodes if node["enabled"]),
         "nodes": nodes,
+    }
+
+
+def phone_provisioning_dry_run(user_group, extension):
+    extension_range = require_provisioning_group(user_group)
+    identity = canonical_phone_plan(user_group, extension)
+    extension_text = identity["extension"]
+    range_start = str(extension_range["start"])
+    range_end = str(extension_range["end"])
+
+    enabled_nodes = [node for node in identity["nodes"] if node["enabled"]]
+    all_logins = [node["login"] for node in identity["nodes"]]
+    all_dialplans = [node["dialplan_number"] for node in identity["nodes"]]
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT extension, server_ip, user_group, active
+              FROM phones
+             WHERE extension=%s
+             ORDER BY server_ip
+            """,
+            (extension_text,),
+        )
+        existing_extension_rows = cursor.fetchall()
+
+        login_placeholders = ",".join(["%s"] * len(all_logins))
+        cursor.execute(
+            """
+            SELECT extension, server_ip, login
+              FROM phones
+             WHERE login IN (%s)
+             ORDER BY login, server_ip
+            """ % login_placeholders,
+            tuple(all_logins),
+        )
+        login_collisions = cursor.fetchall()
+
+        dialplan_placeholders = ",".join(["%s"] * len(all_dialplans))
+        cursor.execute(
+            """
+            SELECT extension, server_ip, dialplan_number
+              FROM phones
+             WHERE dialplan_number IN (%s)
+             ORDER BY dialplan_number, server_ip
+            """ % dialplan_placeholders,
+            tuple(all_dialplans),
+        )
+        dialplan_collisions = cursor.fetchall()
+
+        node_plans = []
+        blockers = []
+        warnings = []
+
+        for node in identity["nodes"]:
+            cursor.execute(
+                """
+                SELECT extension, server_ip, active, user_group, protocol,
+                       template_id, ext_context, phone_context, is_webphone,
+                       codecs_list, codecs_with_template,
+                       LENGTH(conf_secret) AS conf_secret_len
+                  FROM phones
+                 WHERE user_group=%s
+                   AND server_ip=%s
+                   AND active='Y'
+                   AND extension >= %s
+                   AND extension <= %s
+                 ORDER BY extension
+                 LIMIT 1
+                """,
+                (
+                    user_group,
+                    node["server_ip"],
+                    range_start,
+                    range_end,
+                ),
+            )
+            source = cursor.fetchone()
+
+            template_ok = bool(
+                source
+                and source.get("template_id")
+                and int(source.get("conf_secret_len") or 0) > 0
+            )
+
+            node_plan = {
+                "server_ip": node["server_ip"],
+                "enabled": node["enabled"],
+                "required": node["enabled"],
+                "target_login": node["login"],
+                "target_dialplan_number": node["dialplan_number"],
+                "template_found": source is not None,
+                "template_ok": template_ok,
+                "template_source_extension": (
+                    str(source["extension"]) if source else None
+                ),
+                "template_summary": (
+                    {
+                        "protocol": source.get("protocol"),
+                        "template_id": source.get("template_id"),
+                        "ext_context": source.get("ext_context"),
+                        "phone_context": source.get("phone_context"),
+                        "is_webphone": source.get("is_webphone"),
+                        "codecs_list": source.get("codecs_list"),
+                        "codecs_with_template": source.get("codecs_with_template"),
+                        "conf_secret_configured": int(source.get("conf_secret_len") or 0) > 0,
+                    }
+                    if source else None
+                ),
+            }
+            node_plans.append(node_plan)
+
+            if node["enabled"] and not template_ok:
+                blockers.append(
+                    "NODE_TEMPLATE_MISSING_OR_INVALID:%s" % node["server_ip"]
+                )
+            elif not node["enabled"] and not template_ok:
+                warnings.append(
+                    "DISABLED_NODE_TEMPLATE_MISSING_OR_INVALID:%s" % node["server_ip"]
+                )
+
+    if existing_extension_rows:
+        blockers.append("TARGET_EXTENSION_ALREADY_EXISTS")
+
+    enabled_logins = set(node["login"] for node in enabled_nodes)
+    enabled_dialplans = set(node["dialplan_number"] for node in enabled_nodes)
+
+    enabled_login_collisions = [
+        row for row in login_collisions if str(row.get("login") or "") in enabled_logins
+    ]
+    enabled_dialplan_collisions = [
+        row for row in dialplan_collisions
+        if str(row.get("dialplan_number") or "") in enabled_dialplans
+    ]
+
+    if enabled_login_collisions:
+        blockers.append("TARGET_LOGIN_COLLISION")
+    if enabled_dialplan_collisions:
+        blockers.append("TARGET_DIALPLAN_COLLISION")
+
+    disabled_login_collisions = [
+        row for row in login_collisions if str(row.get("login") or "") not in enabled_logins
+    ]
+    disabled_dialplan_collisions = [
+        row for row in dialplan_collisions
+        if str(row.get("dialplan_number") or "") not in enabled_dialplans
+    ]
+    if disabled_login_collisions:
+        warnings.append("DISABLED_NODE_LOGIN_COLLISION")
+    if disabled_dialplan_collisions:
+        warnings.append("DISABLED_NODE_DIALPLAN_COLLISION")
+
+    status = "READY" if not blockers else "BLOCKED"
+
+    return {
+        "mode": "DRY_RUN",
+        "write_performed": False,
+        "status": status,
+        "user_group": user_group,
+        "extension": extension_text,
+        "identity_policy": identity["identity_policy"],
+        "required_nodes": identity["required_nodes"],
+        "storage_engine": "MyISAM",
+        "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
+        "precheck": {
+            "extension_unused": not bool(existing_extension_rows),
+            "enabled_login_collisions": len(enabled_login_collisions),
+            "enabled_dialplan_collisions": len(enabled_dialplan_collisions),
+            "templates_ready": all(
+                row["template_ok"] for row in node_plans if row["required"]
+            ),
+        },
+        "blockers": blockers,
+        "warnings": warnings,
+        "nodes": node_plans,
     }
 
 
@@ -894,6 +1070,11 @@ def group_extension_inventory(user_group):
 @app.get("/api/groups/{user_group}/extensions/{extension}/plan")
 def group_extension_plan(user_group, extension):
     return canonical_phone_plan(user_group, extension)
+
+
+@app.get("/api/groups/{user_group}/extensions/{extension}/provisioning-plan")
+def group_extension_provisioning_plan(user_group, extension):
+    return phone_provisioning_dry_run(user_group, extension)
 
 
 @app.get("/api/extensions/audit")
