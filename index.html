@@ -55,7 +55,7 @@
           <div class="field">
             <label>Bloque de extensiones</label>
             <input id="extensionRule" type="text" value="Selecciona un User Group" disabled />
-            <div class="hint">El backend controla el bloque permitido. La asignación automática y el reciclaje todavía permanecen deshabilitados.</div>
+            <div id="extensionPoolStatus" class="hint">Selecciona un grupo para consultar su inventario.</div>
           </div>
           <div class="field"><label>Personas</label><textarea id="bulkText" placeholder="Juan Carlos,Pérez,López&#10;María Fernanda,Hernández,Soto&#10;Luis,Gómez,Ruiz"></textarea><div class="hint">Una persona por línea: <strong>Nombre(s), Apellido paterno, Apellido materno</strong>.</div></div>
           <div class="rule"><strong>Regla EHECTO</strong><br>Primera letra del apellido paterno + primer nombre. Si existe, amplía el apellido: <code>PJUAN → PEJUAN → PERJUAN…</code>.<br><br><strong>CP2:</strong> el alta sólo se considerará completa cuando existan tanto el usuario VICIdial como su extensión.</div>
@@ -89,7 +89,7 @@
   function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').classList.remove('show'),3200)}
   async function api(path, options={}){const response=await fetch(API+path,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.detail||`HTTP ${response.status}`);return data}
   function setConnection(ok,text){$('serverDot').className='dot '+(ok?'ok':'bad');$('topDot').className='dot '+(ok?'ok':'bad');$('connectionText').textContent=text;$('serverText').textContent=ok?'API vici97 activa y vici222 accesible.':'Sin conexión con backend o DB central.'}
-  function resetTemplate(group='—'){$('tplUser').textContent='—';$('tplLevel').textContent='—';$('tplGroup').textContent=group||'—';$('tplName').textContent='—';$('passDefaultStatus').textContent='—';$('extensionRule').value=group?'Consultando bloque…':'Selecciona un User Group';selectedTemplate=null;$('previewBtn').disabled=true}
+  function resetTemplate(group='—'){$('tplUser').textContent='—';$('tplLevel').textContent='—';$('tplGroup').textContent=group||'—';$('tplName').textContent='—';$('passDefaultStatus').textContent='—';$('extensionRule').value=group?'Consultando bloque…':'Selecciona un User Group';$('extensionPoolStatus').textContent=group?'Consultando inventario…':'Selecciona un grupo para consultar su inventario.';selectedTemplate=null;$('previewBtn').disabled=true}
 
   async function boot(){
     try{
@@ -113,6 +113,8 @@
       const data=await api(`/groups/${encodeURIComponent(group)}/template`);$('passDefaultStatus').textContent=data.default_password_configured?'Configurado':'No configurado';
       if(data.extension_range){$('extensionRule').value=`${data.extension_range.start} – ${data.extension_range.end} (${data.extension_range.capacity} posiciones)`}else{$('extensionRule').value='Sin bloque configurado'}
       if(!data.configured){$('templateWarning').textContent=`El grupo ${group} todavía no tiene usuario base configurado en vici97.`;$('templateWarning').classList.remove('hidden');return}
+      const inventory=await api(`/groups/${encodeURIComponent(group)}/extensions/inventory`);const s=inventory.summary;
+      $('extensionPoolStatus').textContent='Inventario: '+s.free+' reciclable(s) · '+s.uncreated+' sin crear · '+s.legacy+' legacy'+(s.group_mismatches?' · ⚠ '+s.group_mismatches+' desalineada(s)':'')+'.';
       selectedTemplate=data.template;$('tplUser').textContent=selectedTemplate.user;$('tplLevel').textContent=selectedTemplate.user_level;$('tplGroup').textContent=selectedTemplate.user_group;$('tplName').textContent=selectedTemplate.full_name||'—';$('previewBtn').disabled=false;
     }catch(error){$('templateWarning').textContent=error.message;$('templateWarning').classList.remove('hidden');toast(error.message)}
   }
