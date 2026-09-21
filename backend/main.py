@@ -58,7 +58,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.10.0-cluster-topology")
+app = FastAPI(title="Vici-Users API", version="0.11.0-canonical-phone-plan")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -228,9 +228,18 @@ def load_cluster_nodes():
                 detail="server_ip vacío o duplicado en cluster_nodes.json",
             )
         seen.add(server_ip)
+        login_suffix = str(item.get("login_suffix") or "").strip()
+        dialplan_prefix = str(item.get("dialplan_prefix") or "")
+        if len(login_suffix) != 1:
+            raise HTTPException(
+                status_code=503,
+                detail="login_suffix inválido para %s" % server_ip,
+            )
         nodes.append({
             "server_ip": server_ip,
             "enabled": bool(item.get("enabled", True)),
+            "login_suffix": login_suffix,
+            "dialplan_prefix": dialplan_prefix,
             "note": str(item.get("note") or "").strip(),
         })
 
@@ -242,6 +251,43 @@ def load_cluster_nodes():
 
     return {
         "cluster": str(data.get("cluster") or "EHECTO"),
+        "nodes": nodes,
+    }
+
+
+def canonical_phone_plan(user_group, extension):
+    extension_range = require_provisioning_group(user_group)
+    extension_text = str(extension).strip()
+    if not extension_text.isdigit():
+        raise HTTPException(status_code=400, detail="La extensión debe ser numérica")
+
+    extension_number = int(extension_text)
+    if extension_number < extension_range["start"] or extension_number > extension_range["end"]:
+        raise HTTPException(
+            status_code=409,
+            detail="La extensión %s está fuera del bloque de %s" % (
+                extension_text,
+                user_group,
+            ),
+        )
+
+    topology = load_cluster_nodes()
+    nodes = []
+    for node in topology["nodes"]:
+        nodes.append({
+            "server_ip": node["server_ip"],
+            "enabled": node["enabled"],
+            "login": extension_text + node["login_suffix"],
+            "dialplan_number": node["dialplan_prefix"] + extension_text,
+            "login_suffix": node["login_suffix"],
+            "dialplan_prefix": node["dialplan_prefix"],
+        })
+
+    return {
+        "user_group": user_group,
+        "extension": extension_text,
+        "identity_policy": topology.get("identity_policy", "canonical-v1"),
+        "required_nodes": sum(1 for node in nodes if node["enabled"]),
         "nodes": nodes,
     }
 
@@ -843,6 +889,11 @@ def group_extension_range(user_group):
 @app.get("/api/groups/{user_group}/extensions/inventory")
 def group_extension_inventory(user_group):
     return extension_inventory_snapshot(user_group)
+
+
+@app.get("/api/groups/{user_group}/extensions/{extension}/plan")
+def group_extension_plan(user_group, extension):
+    return canonical_phone_plan(user_group, extension)
 
 
 @app.get("/api/extensions/audit")
