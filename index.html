@@ -84,6 +84,13 @@
   let selectedTemplate = null;
   let previewPayload = null;
 
+  // Grupos temporalmente fuera del flujo de alta.
+  // Se mantienen en backend/configuración para poder reactivarlos después.
+  const DISABLED_PROVISIONING_GROUPS = new Set([
+    'CC-CORTIZO-4PV',
+    'CC-CORTIZO-MOROSO'
+  ]);
+
   const $ = id => document.getElementById(id);
   const escapeHtml = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
   function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').classList.remove('show'),3200)}
@@ -100,7 +107,8 @@
 
   async function loadGroups(){
     const data=await api('/groups');const select=$('userGroup');
-    select.innerHTML='<option value="">Selecciona un User Group</option>'+data.groups.map(g=>{
+    const availableGroups=data.groups.filter(g=>!DISABLED_PROVISIONING_GROUPS.has(g.user_group));
+    select.innerHTML='<option value="">Selecciona un User Group</option>'+availableGroups.map(g=>{
       const flags=[];if(!g.template_configured)flags.push('SIN PLANTILLA');if(!g.default_password_configured)flags.push('SIN PASSWORD DEFAULT');
       return `<option value="${escapeHtml(g.user_group)}">${escapeHtml(g.user_group)}${g.group_name?' · '+escapeHtml(g.group_name):''}${flags.length?' · '+flags.join(' / '):''}</option>`
     }).join('');select.disabled=false;
