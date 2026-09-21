@@ -392,6 +392,21 @@ def extension_inventory_snapshot(user_group):
             "updated_at": tracked.get("updated_at") if tracked else None,
         })
 
+    free_candidates = [
+        row["extension"] for row in positions if row["status"] == "FREE"
+    ]
+    uncreated_candidates = [
+        row["extension"] for row in positions if row["status"] == "UNCREATED"
+    ]
+    next_candidate = None
+    next_candidate_source = None
+    if free_candidates:
+        next_candidate = free_candidates[0]
+        next_candidate_source = "FREE"
+    elif uncreated_candidates:
+        next_candidate = uncreated_candidates[0]
+        next_candidate_source = "UNCREATED"
+
     return {
         "user_group": user_group,
         "extension_range": extension_range,
@@ -404,8 +419,9 @@ def extension_inventory_snapshot(user_group):
             "in_use": counts["IN_USE"],
             "error": counts["ERROR"],
             "group_mismatches": mismatches,
+            "next_candidate": next_candidate,
+            "next_candidate_source": next_candidate_source,
         },
-        "positions": positions,
     }
 
 
