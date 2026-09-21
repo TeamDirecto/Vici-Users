@@ -39,7 +39,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.6.0-managed-groups")
+app = FastAPI(title="Vici-Users API", version="0.7.0-dedicated-base-users")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
