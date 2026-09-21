@@ -24,6 +24,12 @@ GROUP_TEMPLATES_FILE = Path(
 GROUP_DEFAULTS_FILE = Path(
     os.getenv("VICI_USERS_GROUP_DEFAULTS_FILE", "/etc/vici-users/group_defaults.json")
 )
+MANAGED_GROUPS_FILE = Path(
+    os.getenv(
+        "VICI_USERS_MANAGED_GROUPS_FILE",
+        str(APP_ROOT / "config" / "managed_groups.json"),
+    )
+)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -33,7 +39,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.5.0-group-defaults")
+app = FastAPI(title="Vici-Users API", version="0.6.0-managed-groups")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -109,6 +115,42 @@ def load_group_defaults():
         if group and password:
             clean[group] = password
     return clean
+
+
+def load_managed_groups():
+    # type: () -> List[str]
+    if not MANAGED_GROUPS_FILE.exists():
+        return []
+    try:
+        with MANAGED_GROUPS_FILE.open("r") as fh:
+            data = json.load(fh)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Configuración de grupos administrados inválida: %s" % exc,
+        )
+    if not isinstance(data, list):
+        raise HTTPException(
+            status_code=503,
+            detail="%s debe contener una lista JSON" % MANAGED_GROUPS_FILE.name,
+        )
+    clean = []
+    seen = set()
+    for group in data:
+        group = str(group).strip()
+        if group and group not in seen:
+            clean.append(group)
+            seen.add(group)
+    return clean
+
+
+def require_managed_group(user_group):
+    managed = set(load_managed_groups())
+    if user_group not in managed:
+        raise HTTPException(
+            status_code=403,
+            detail="El User Group %s no está autorizado para el flujo de clonación" % user_group,
+        )
 
 
 def db_config():
@@ -262,6 +304,13 @@ def health():
         default_count = 0
         defaults_ok = False
 
+    try:
+        managed_count = len(load_managed_groups())
+        managed_ok = True
+    except HTTPException:
+        managed_count = 0
+        managed_ok = False
+
     return {
         "status": "ok" if db_ok else "degraded",
         "app_node": socket.gethostname(),
@@ -282,6 +331,9 @@ def health():
         "group_defaults_file": str(GROUP_DEFAULTS_FILE),
         "group_defaults_ok": defaults_ok,
         "group_defaults_count": default_count,
+        "managed_groups_file": str(MANAGED_GROUPS_FILE),
+        "managed_groups_ok": managed_ok,
+        "managed_groups_count": managed_count,
     }
 
 
@@ -289,7 +341,8 @@ def health():
 def groups():
     templates = load_group_templates()
     defaults = load_group_defaults()
-    configured_groups = set(templates.keys()) | set(defaults.keys())
+    managed_groups = load_managed_groups()
+    managed_set = set(managed_groups)
 
     with db_cursor() as cursor:
         cursor.execute(
@@ -303,11 +356,9 @@ def groups():
         )
         rows = cursor.fetchall()
 
-    # Cuando ya existe configuración local, el front operativo sólo muestra
-    # los grupos administrados por Vici-Users. Si aún no existe, muestra todos
-    # para facilitar el bootstrap inicial.
-    if configured_groups:
-        rows = [row for row in rows if row["user_group"] in configured_groups]
+    rows = [row for row in rows if row["user_group"] in managed_set]
+    order = dict((group, idx) for idx, group in enumerate(managed_groups))
+    rows.sort(key=lambda row: order.get(row["user_group"], 999999))
 
     for row in rows:
         group = row["user_group"]
@@ -319,6 +370,7 @@ def groups():
 
 @app.get("/api/groups/{user_group}/template")
 def group_template(user_group):
+    require_managed_group(user_group)
     templates = load_group_templates()
     defaults = load_group_defaults()
     configured_user = templates.get(user_group)
@@ -350,6 +402,7 @@ def group_template(user_group):
 
 @app.get("/api/groups/{user_group}/users")
 def group_users(user_group):
+    require_managed_group(user_group)
     # Endpoint de diagnóstico/configuración. El front operativo no lo usa.
     with db_cursor() as cursor:
         cursor.execute(
@@ -387,6 +440,7 @@ def user_detail(user):
 
 @app.post("/api/users/preview")
 def preview_users(payload: PreviewRequest):
+    require_managed_group(payload.user_group)
     template = get_group_template(payload.user_group)
     if not template:
         raise HTTPException(
@@ -487,6 +541,7 @@ def preview_users(payload: PreviewRequest):
 
 @app.post("/api/users/create")
 def create_users(payload: CreateRequest):
+    require_managed_group(payload.user_group)
     if not CREATE_ENABLED:
         raise HTTPException(
             status_code=403,
