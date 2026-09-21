@@ -175,3 +175,20 @@ El plan:
 `VICI_USERS_ENABLE_CREATE=false` debe permanecer así hasta que este plan sea
 validado y se implementen autenticación, auditoría e idempotencia para la
 escritura real.
+
+
+### Mapeo de fullname en phones
+
+El dry-run detectó que `phones.fullname` contiene la extensión fuente. Para
+altas nuevas, el portal conserva el formato exacto de la plantilla del mismo
+nodo y sustituye únicamente la extensión fuente por la extensión destino.
+
+Ejemplo conceptual:
+
+```text
+fullname fuente:  <formato que contiene 95201>
+fullname destino: <mismo formato con 95217>
+```
+
+`fullname` pasa a formar parte del conjunto explícito de campos de identidad
+del teléfono y deja de copiarse sin transformación.
