@@ -175,8 +175,19 @@
 
   function renderPreview(data){
     $('statTotal').textContent=data.requested;$('statAvailable').textContent=data.available;$('statResolved').textContent=data.resolved;$('statConflict').textContent=data.conflicts;$('previewSummary').textContent=`${data.requested} registro${data.requested===1?'':'s'}`;$('templateBadge').textContent=`Plantilla ${data.template.user}`;
-    const range=data.extension_range;const rangeText=range?`${range.start}–${range.end}`:'—';
-    $('rows').innerHTML=data.users.map(u=>{const status=u.status==='AVAILABLE'?(u.resolved?'<span class="badge amber">Colisión resuelta</span>':'<span class="badge green">Disponible</span>'):'<span class="badge red">Conflicto</span>';const person=`${u.first_names} ${u.paternal} ${u.maternal||''}`.trim();return `<tr><td><strong>${escapeHtml(person)}</strong></td><td><code>${escapeHtml(u.initial||'—')}</code></td><td><code>${escapeHtml(u.username||'—')}</code></td><td><span class="badge gray">Pool ${escapeHtml(rangeText)}</span></td><td>${status}</td><td>${escapeHtml((u.attempts||[]).join(' → ')||u.reason||'—')}</td></tr>`}).join('');$('empty').classList.add('hidden');$('preview').classList.remove('hidden')
+    const alloc=data.extension_allocation||{};
+    $('createNote').textContent='Preview: '+(alloc.allocated||0)+' extensión(es) asignada(s) · '+(alloc.required_nodes||0)+' nodo(s) requeridos · escritura deshabilitada.';
+    $('rows').innerHTML=data.users.map(u=>{
+      const status=u.status==='AVAILABLE'?(u.resolved?'<span class="badge amber">Colisión resuelta</span>':'<span class="badge green">Disponible</span>'):'<span class="badge red">Conflicto</span>';
+      const person=`${u.first_names} ${u.paternal} ${u.maternal||''}`.trim();
+      let extension='—';
+      if(u.extension){
+        const source=u.extension_source==='FREE'?'Reciclada':'Nueva';
+        const cls=u.extension_source==='FREE'?'amber':'gray';
+        extension='<code>'+escapeHtml(u.extension)+'</code> <span class="badge '+cls+'">'+source+'</span>';
+      }
+      return `<tr><td><strong>${escapeHtml(person)}</strong></td><td><code>${escapeHtml(u.initial||'—')}</code></td><td><code>${escapeHtml(u.username||'—')}</code></td><td>${extension}</td><td>${status}</td><td>${escapeHtml((u.attempts||[]).join(' → ')||u.reason||'—')}</td></tr>`
+    }).join('');$('empty').classList.add('hidden');$('preview').classList.remove('hidden')
   }
 
   $('navProvision').addEventListener('click',()=>showView('provision'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
