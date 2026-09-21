@@ -62,3 +62,28 @@ Formato:
 El archivo sólo define el bloque permitido. Todavía no implica que una posición
 esté libre, ocupada o reciclable; esa validación corresponde al inventario y al
 motor de provisión.
+
+
+## Inventario local de extensiones
+
+El estado administrado por el portal se guarda fuera de VICIdial, por defecto en:
+
+```text
+/var/lib/vici-users/extension_inventory.db
+```
+
+Estados previstos:
+
+- `UNCREATED`: número dentro del bloque que todavía no existe en `phones`;
+- `LEGACY`: existe en `phones`, pero el portal aún no administra su ciclo de vida;
+- `FREE`: extensión liberada explícitamente por un cambio gestionado por el portal;
+- `RESERVED`: reservada temporalmente durante una operación;
+- `IN_USE`: asignada por el portal;
+- `ERROR`: estado inconsistente que requiere revisión.
+
+Por seguridad, una extensión `LEGACY` nunca se considera reciclable automáticamente.
+El pool reutilizable comienza únicamente con extensiones que el propio portal haya
+marcado `FREE` después de completar correctamente una reasignación.
+
+El endpoint de inventario público devuelve sólo un resumen y no publica IPs de
+dialers ni el detalle completo de posiciones.
