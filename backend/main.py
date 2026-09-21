@@ -100,7 +100,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.14.0-write-plan-dry-run")
+app = FastAPI(title="Vici-Users API", version="0.14.1-phone-fullname-mapping")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -593,6 +593,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
             "pass",
             "active",
             "user_group",
+            "fullname",
         }
 
         source_by_server = dict(
@@ -645,6 +646,13 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                         % (server_ip, field)
                     )
 
+            source_fullname = str(source_row.get("fullname") or "")
+            target_fullname = (
+                source_fullname.replace(source_extension_text, extension_text)
+                if source_extension_text and source_extension_text in source_fullname
+                else source_fullname
+            )
+
             override_values = {
                 "extension": extension_text,
                 "dialplan_number": target["dialplan_number"],
@@ -654,6 +662,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                 "pass": extension_text,
                 "active": "N",
                 "user_group": user_group,
+                "fullname": target_fullname,
             }
 
             select_parts = []
@@ -700,6 +709,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                     {"field": "pass", "from": "<SOURCE_PHONE_PASS>", "to": "<TARGET_EXTENSION>"},
                     {"field": "active", "from": str(source_row.get("active") or ""), "to": "N"},
                     {"field": "user_group", "from": str(source_row.get("user_group") or ""), "to": user_group},
+                    {"field": "fullname", "from": source_fullname, "to": target_fullname},
                 ],
                 "copied_fields_count": len(phone_columns) - len(phone_override_fields),
                 "conf_secret_strategy": "COPY_FROM_NODE_TEMPLATE",
