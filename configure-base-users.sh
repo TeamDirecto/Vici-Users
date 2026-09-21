@@ -4,10 +4,12 @@ set -Eeuo pipefail
 APP_DIR="/opt/vici-users"
 CFG_DIR="/etc/vici-users"
 CFG_FILE="${CFG_DIR}/group_templates.json"
+GROUPS_FILE="${APP_DIR}/config/managed_groups.json"
 PYTHON_BIN="${APP_DIR}/.venv/bin/python"
 
 [ "$(id -u)" -eq 0 ] || { echo "[ERROR] Ejecuta como root" >&2; exit 1; }
 [ -x "$PYTHON_BIN" ] || { echo "[ERROR] No existe $PYTHON_BIN" >&2; exit 1; }
+[ -f "$GROUPS_FILE" ] || { echo "[ERROR] No existe $GROUPS_FILE" >&2; exit 1; }
 cd "$APP_DIR"
 
 mkdir -p "$CFG_DIR"
@@ -19,7 +21,7 @@ if [ -f "$CFG_FILE" ]; then
   echo "[OK] Backup: ${CFG_FILE}.bak_${TS}"
 fi
 
-"$PYTHON_BIN" - "$CFG_FILE" <<'PY'
+"$PYTHON_BIN" - "$CFG_FILE" "$GROUPS_FILE" <<'PY'
 import json
 import os
 import sys
@@ -27,14 +29,10 @@ import sys
 from backend.main import db_cursor
 
 path = sys.argv[1]
-groups = [
-    "CC-CORTIZO-4PV",
-    "CC-CORTIZO-BANCO-AZT",
-    "CC-CORTIZO-BANORTE",
-    "CC-CORTIZO-BBVA",
-    "CC-CORTIZO-GMF",
-    "CC-CORTIZO-LABORATOR",
-]
+groups_path = sys.argv[2]
+with open(groups_path, "r") as fh:
+    groups = json.load(fh)
+groups = [str(g).strip() for g in groups if str(g).strip()]
 
 existing = {}
 if os.path.exists(path):
