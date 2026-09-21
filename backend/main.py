@@ -750,6 +750,37 @@ def group_extension_inventory(user_group):
     return extension_inventory_snapshot(user_group)
 
 
+@app.get("/api/extensions/audit")
+def extension_audit():
+    ranges = load_extension_ranges()
+    managed_groups = load_managed_groups()
+    order = dict((group, idx) for idx, group in enumerate(managed_groups))
+    groups = []
+
+    for user_group in sorted(ranges.keys(), key=lambda group: order.get(group, 999999)):
+        snapshot = extension_inventory_snapshot(user_group)
+        groups.append({
+            "user_group": user_group,
+            "extension_range": snapshot["extension_range"],
+            "summary": snapshot["summary"],
+        })
+
+    return {
+        "groups": groups,
+        "totals": {
+            "groups": len(groups),
+            "capacity": sum(row["summary"]["capacity"] for row in groups),
+            "uncreated": sum(row["summary"]["uncreated"] for row in groups),
+            "legacy": sum(row["summary"]["legacy"] for row in groups),
+            "free": sum(row["summary"]["free"] for row in groups),
+            "reserved": sum(row["summary"]["reserved"] for row in groups),
+            "in_use": sum(row["summary"]["in_use"] for row in groups),
+            "error": sum(row["summary"]["error"] for row in groups),
+            "group_mismatches": sum(row["summary"]["group_mismatches"] for row in groups),
+        },
+    }
+
+
 @app.post("/api/users/preview")
 def preview_users(payload: PreviewRequest):
     extension_range = require_provisioning_group(payload.user_group)
