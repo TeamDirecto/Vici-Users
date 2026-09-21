@@ -30,6 +30,12 @@ MANAGED_GROUPS_FILE = Path(
         str(APP_ROOT / "config" / "managed_groups.json"),
     )
 )
+EXTENSION_RANGES_FILE = Path(
+    os.getenv(
+        "VICI_USERS_EXTENSION_RANGES_FILE",
+        str(APP_ROOT / "config" / "extension_ranges.json"),
+    )
+)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -39,7 +45,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.7.1-inactive-base-template-fix")
+app = FastAPI(title="Vici-Users API", version="0.8.0-extension-ranges")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -144,6 +150,47 @@ def load_managed_groups():
     return clean
 
 
+def load_extension_ranges():
+    # type: () -> Dict[str, Dict[str, int]]
+    data = _load_json_mapping(EXTENSION_RANGES_FILE, "de rangos de extensiones")
+    clean = {}
+    managed = set(load_managed_groups())
+
+    for group, value in data.items():
+        group = str(group).strip()
+        if group not in managed:
+            raise HTTPException(
+                status_code=503,
+                detail="Rango configurado para grupo no administrado: %s" % group,
+            )
+        if not isinstance(value, dict):
+            raise HTTPException(
+                status_code=503,
+                detail="Rango inválido para %s" % group,
+            )
+        try:
+            start = int(value["start"])
+            end = int(value["end"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=503,
+                detail="Rango inválido para %s: start/end requeridos" % group,
+            )
+        if start <= 0 or end < start:
+            raise HTTPException(
+                status_code=503,
+                detail="Rango inválido para %s: %s-%s" % (group, start, end),
+            )
+        capacity = end - start + 1
+        if capacity > 50:
+            raise HTTPException(
+                status_code=503,
+                detail="Rango de %s excede el máximo de 50 extensiones" % group,
+            )
+        clean[group] = {"start": start, "end": end, "capacity": capacity}
+    return clean
+
+
 def require_managed_group(user_group):
     managed = set(load_managed_groups())
     if user_group not in managed:
@@ -151,6 +198,20 @@ def require_managed_group(user_group):
             status_code=403,
             detail="El User Group %s no está autorizado para el flujo de clonación" % user_group,
         )
+
+
+def require_provisioning_group(user_group):
+    require_managed_group(user_group)
+    ranges = load_extension_ranges()
+    if user_group not in ranges:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "El User Group %s está temporalmente fuera del flujo de alta "
+                "porque no tiene bloque de extensiones configurado"
+            ) % user_group,
+        )
+    return ranges[user_group]
 
 
 def db_config():
@@ -310,6 +371,13 @@ def health():
         managed_count = 0
         managed_ok = False
 
+    try:
+        extension_ranges_count = len(load_extension_ranges())
+        extension_ranges_ok = True
+    except HTTPException:
+        extension_ranges_count = 0
+        extension_ranges_ok = False
+
     return {
         "status": "ok" if db_ok else "degraded",
         "app_node": socket.gethostname(),
@@ -333,6 +401,9 @@ def health():
         "managed_groups_file": str(MANAGED_GROUPS_FILE),
         "managed_groups_ok": managed_ok,
         "managed_groups_count": managed_count,
+        "extension_ranges_file": str(EXTENSION_RANGES_FILE),
+        "extension_ranges_ok": extension_ranges_ok,
+        "extension_ranges_count": extension_ranges_count,
     }
 
 
@@ -340,6 +411,7 @@ def health():
 def groups():
     templates = load_group_templates()
     defaults = load_group_defaults()
+    ranges = load_extension_ranges()
     managed_groups = load_managed_groups()
     managed_set = set(managed_groups)
 
@@ -364,6 +436,8 @@ def groups():
         row["template_configured"] = group in templates
         row["template_user"] = templates.get(group)
         row["default_password_configured"] = group in defaults
+        row["provisioning_enabled"] = group in ranges
+        row["extension_range"] = ranges.get(group)
     return {"groups": rows}
 
 
@@ -372,12 +446,15 @@ def group_template(user_group):
     require_managed_group(user_group)
     templates = load_group_templates()
     defaults = load_group_defaults()
+    ranges = load_extension_ranges()
     configured_user = templates.get(user_group)
     if not configured_user:
         return {
             "user_group": user_group,
             "configured": False,
             "default_password_configured": user_group in defaults,
+            "provisioning_enabled": user_group in ranges,
+            "extension_range": ranges.get(user_group),
             "template": None,
         }
 
@@ -395,6 +472,8 @@ def group_template(user_group):
         "user_group": user_group,
         "configured": True,
         "default_password_configured": user_group in defaults,
+        "provisioning_enabled": user_group in ranges,
+        "extension_range": ranges.get(user_group),
         "template": template,
     }
 
@@ -437,9 +516,19 @@ def user_detail(user):
         return row
 
 
+@app.get("/api/groups/{user_group}/extension-range")
+def group_extension_range(user_group):
+    extension_range = require_provisioning_group(user_group)
+    return {
+        "user_group": user_group,
+        "provisioning_enabled": True,
+        "extension_range": extension_range,
+    }
+
+
 @app.post("/api/users/preview")
 def preview_users(payload: PreviewRequest):
-    require_managed_group(payload.user_group)
+    extension_range = require_provisioning_group(payload.user_group)
     template = get_group_template(payload.user_group)
     if not template:
         raise HTTPException(
@@ -530,6 +619,7 @@ def preview_users(payload: PreviewRequest):
     return {
         "template": template,
         "default_password_configured": payload.user_group in load_group_defaults(),
+        "extension_range": extension_range,
         "requested": len(payload.people),
         "available": sum(1 for row in results if row["status"] == "AVAILABLE"),
         "resolved": sum(1 for row in results if row.get("resolved")),
@@ -540,7 +630,7 @@ def preview_users(payload: PreviewRequest):
 
 @app.post("/api/users/create")
 def create_users(payload: CreateRequest):
-    require_managed_group(payload.user_group)
+    require_provisioning_group(payload.user_group)
     if not CREATE_ENABLED:
         raise HTTPException(
             status_code=403,
