@@ -356,11 +356,11 @@ def extension_inventory_snapshot(user_group):
 
         counts[status] += 1
 
-        phone_groups = sorted(set(
+        row_groups = [
             str(row.get("user_group") or "").strip()
             for row in rows
-            if str(row.get("user_group") or "").strip()
-        ))
+        ]
+        phone_groups = sorted(set(group for group in row_groups if group))
         servers = sorted(set(
             str(row.get("server_ip") or "").strip()
             for row in rows
@@ -369,7 +369,7 @@ def extension_inventory_snapshot(user_group):
 
         if not rows:
             alignment = "N/A"
-        elif phone_groups == [user_group]:
+        elif all(group == user_group for group in row_groups):
             alignment = "ALIGNED"
         else:
             alignment = "MISMATCH"
