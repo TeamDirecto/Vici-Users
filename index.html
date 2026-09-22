@@ -19,7 +19,7 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand"><div class="mark">VU</div><div><strong>Vici-Users</strong><small>Provisioning Console</small></div></div>
-    <div><div class="nav-title">EHECTO</div><button class="nav active" id="navProvision" type="button">＋ Alta de usuarios</button><button class="nav" id="navAudit" type="button">♻ Auditoría de extensiones</button></div>
+    <div><div class="nav-title">EHECTO</div><button class="nav active" id="navProvision" type="button">＋ Alta de usuarios</button><button class="nav" id="navGroupChange" type="button">⇄ Cambio de User Group</button><button class="nav" id="navAudit" type="button">♻ Auditoría de extensiones</button></div>
     <div class="server"><div><span id="serverDot" class="dot"></span><strong>vici97</strong></div><p id="serverText">Comprobando API en vici97 y base vici222…</p></div>
   </aside>
 
@@ -82,6 +82,59 @@
         </div>
       </div>
     </section>
+    </div>
+
+    <div id="groupChangeView" class="hidden">
+      <section class="layout">
+        <div class="card">
+          <div class="head"><div><h2>Cambio de User Group</h2><p>Compara el usuario contra el BASE_* del grupo destino.</p></div><span class="step">Preview</span></div>
+          <div class="body">
+            <div class="field">
+              <label>Usuario VICIdial</label>
+              <input id="groupChangeUser" type="text" maxlength="20" placeholder="Ej. PJUANITO" autocomplete="off" />
+              <div class="hint">Para la validación usaremos PJUANITO. Esta etapa no realiza escrituras.</div>
+            </div>
+            <div class="field">
+              <label>User Group destino</label>
+              <select id="groupChangeTarget" disabled><option>Selecciona primero esta vista…</option></select>
+              <div class="hint">Sólo aparecen grupos administrados que tienen BASE_* configurado.</div>
+            </div>
+            <div class="rule">
+              <strong>Qué se conservaría</strong><br>
+              Username, contraseña, nombre y estado activo.<br><br>
+              <strong>Qué se actualizaría</strong><br>
+              User Group, user level y permisos heredados del BASE_* destino.
+            </div>
+            <div class="btns">
+              <button class="btn primary" id="groupChangePreviewBtn" disabled>Previsualizar cambio</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="head"><div><h2>Resultado</h2><p>Comparación segura, sin modificar VICIdial.</p></div><span class="step">Sin escritura</span></div>
+          <div id="groupChangeEmpty" class="empty"><strong>Aún no hay cambio para revisar</strong><p>Indica usuario y grupo destino.</p></div>
+          <div id="groupChangeResult" class="body hidden">
+            <div id="groupChangeBlocker" class="conn-error hidden"></div>
+            <div id="groupChangeWarning" class="template-warning hidden"></div>
+            <div class="template">
+              <div><span>Usuario</span><strong id="gcUser">—</strong></div>
+              <div><span>Nombre</span><strong id="gcName">—</strong></div>
+              <div><span>Grupo actual</span><strong id="gcCurrentGroup">—</strong></div>
+              <div><span>Grupo destino</span><strong id="gcTargetGroup">—</strong></div>
+              <div><span>BASE destino</span><strong id="gcBase">—</strong></div>
+              <div><span>User level destino</span><strong id="gcLevel">—</strong></div>
+              <div><span>Extensión administrada</span><strong id="gcExtension">—</strong></div>
+              <div><span>Permisos que cambiarían</span><strong id="gcPermissionCount">—</strong></div>
+            </div>
+            <div class="rule" id="gcDetail">—</div>
+            <div class="btns">
+              <button class="btn success" id="groupChangeApplyBtn" disabled>Aplicar cambio</button>
+            </div>
+            <div class="hint">Preview-only: el botón de aplicación permanecerá bloqueado hasta definir el tratamiento de la extensión anterior.</div>
+          </div>
+        </div>
+      </section>
     </div>
 
     <div id="auditView" class="hidden">
@@ -209,6 +262,7 @@
   let authUser = null;
   let pendingOperationKey = null;
   let pendingProvisioning = null;
+  let groupChangeGroupsLoaded = false;
   let receiptCredentials = null;
   let receiptPasswordVisible = false;
   const AUTH_STORAGE_KEY = 'viciUsersAuthToken';
@@ -307,6 +361,9 @@
     previewPayload=null;
     pendingOperationKey=null;
     pendingProvisioning=null;
+    groupChangeGroupsLoaded=false;
+    $('groupChangeTarget').innerHTML='<option>Inicia sesión para continuar</option>';
+    $('groupChangeTarget').disabled=true;
     clearCredentialReceipt();
     $('userGroup').innerHTML='<option value="">Inicia sesión para continuar</option>';
     $('userGroup').disabled=true;
@@ -571,11 +628,119 @@
 
   function showView(view){
     const audit=view==='audit';
-    $('provisionView').classList.toggle('hidden',audit);$('auditView').classList.toggle('hidden',!audit);
-    $('navProvision').classList.toggle('active',!audit);$('navAudit').classList.toggle('active',audit);
-    $('pageTitle').textContent=audit?'Auditoría de extensiones':'Alta masiva de usuarios';
-    $('pageSub').textContent=audit?'Estado de los bloques, extensiones legacy, reciclables y desalineaciones.':'Alta de usuario + extensión: cada User Group utiliza un BASE_* y una contraseña default protegidos en vici97.';
-    if(audit)loadAudit();
+    const groupChange=view==='group-change';
+    const provision=!audit&&!groupChange;
+
+    $('provisionView').classList.toggle('hidden',!provision);
+    $('groupChangeView').classList.toggle('hidden',!groupChange);
+    $('auditView').classList.toggle('hidden',!audit);
+
+    $('navProvision').classList.toggle('active',provision);
+    $('navGroupChange').classList.toggle('active',groupChange);
+    $('navAudit').classList.toggle('active',audit);
+
+    if(audit){
+      $('pageTitle').textContent='Auditoría de extensiones';
+      $('pageSub').textContent='Estado de los bloques, extensiones legacy, reciclables y desalineaciones.';
+      loadAudit();
+    }else if(groupChange){
+      $('pageTitle').textContent='Cambio de User Group';
+      $('pageSub').textContent='Preview de permisos y relación con la extensión administrada antes de modificar VICIdial.';
+      loadGroupChangeGroups();
+    }else{
+      $('pageTitle').textContent='Alta masiva de usuarios';
+      $('pageSub').textContent='Alta de usuario + extensión: cada User Group utiliza un BASE_* y una contraseña default protegidos en vici97.';
+    }
+  }
+
+  async function loadGroupChangeGroups(){
+    if(groupChangeGroupsLoaded)return;
+    const select=$('groupChangeTarget');
+    select.disabled=true;
+    select.innerHTML='<option>Cargando…</option>';
+    try{
+      const data=await api('/groups');
+      const groups=(data.groups||[]).filter(g=>g.template_configured);
+      select.innerHTML='<option value="">Selecciona un User Group destino</option>'+
+        groups.map(g=>'<option value="'+escapeHtml(g.user_group)+'">'+escapeHtml(g.user_group)+(g.group_name?' · '+escapeHtml(g.group_name):'')+'</option>').join('');
+      select.disabled=false;
+      groupChangeGroupsLoaded=true;
+      updateGroupChangePreviewButton();
+    }catch(error){
+      select.innerHTML='<option>No disponible</option>';
+      toast(error.message);
+    }
+  }
+
+  function updateGroupChangePreviewButton(){
+    const ready=Boolean(
+      $('groupChangeUser').value.trim() &&
+      $('groupChangeTarget').value
+    );
+    $('groupChangePreviewBtn').disabled=!ready;
+  }
+
+  function friendlyGroupChangeWarning(code){
+    if(code.indexOf('MANAGED_EXTENSION_WOULD_REMAIN_IN_SOURCE_BLOCK:')===0){
+      return 'La extensión '+code.split(':')[1]+' pertenece al bloque del grupo actual. Un cambio sólo de permisos dejaría usuario y extensión en grupos distintos.';
+    }
+    if(code.indexOf('MANAGED_EXTENSION_SOURCE_GROUP_MISMATCH:')===0){
+      return 'La extensión '+code.split(':')[1]+' ya presenta una desalineación con el grupo actual.';
+    }
+    return code;
+  }
+
+  async function previewGroupChange(){
+    const username=$('groupChangeUser').value.trim().toUpperCase();
+    const target=$('groupChangeTarget').value;
+    if(!username||!target)return;
+
+    $('groupChangePreviewBtn').disabled=true;
+    $('groupChangePreviewBtn').textContent='Consultando…';
+
+    try{
+      const data=await api('/users/group-change/preview',{
+        method:'POST',
+        body:JSON.stringify({
+          username:username,
+          target_user_group:target
+        })
+      });
+
+      $('gcUser').textContent=data.username||'—';
+      $('gcName').textContent=data.full_name||'—';
+      $('gcCurrentGroup').textContent=data.current_user_group||'—';
+      $('gcTargetGroup').textContent=data.target_user_group||'—';
+      $('gcBase').textContent=data.target_template_user||'—';
+      $('gcLevel').textContent=String(data.target_user_level||'—');
+
+      const extensions=(data.managed_extensions||[]).map(x=>x.extension+' ('+x.user_group+')');
+      $('gcExtension').textContent=extensions.length?extensions.join(', '):'No administrada por portal';
+      $('gcPermissionCount').textContent=String(data.permission_fields_changed||0)+' / '+String(data.permission_fields_total||0);
+
+      const changed=(data.changed_permission_fields||[]);
+      $('gcDetail').innerHTML='<strong>Campos de permisos que cambiarían:</strong><br>'+
+        (changed.length?escapeHtml(changed.join(', ')):'Ninguno');
+
+      const blockers=data.blockers||[];
+      $('groupChangeBlocker').textContent=blockers.length?'Bloqueado: '+blockers.join(', '):'';
+      $('groupChangeBlocker').classList.toggle('hidden',!blockers.length);
+
+      const warnings=(data.warnings||[]).map(friendlyGroupChangeWarning);
+      $('groupChangeWarning').textContent=warnings.join(' ');
+      $('groupChangeWarning').classList.toggle('hidden',!warnings.length);
+
+      $('groupChangeEmpty').classList.add('hidden');
+      $('groupChangeResult').classList.remove('hidden');
+      $('groupChangeApplyBtn').disabled=true;
+
+      toast('Preview de cambio de grupo completado. No se escribió nada.');
+    }catch(error){
+      toast(error.message);
+    }finally{
+      $('groupChangePreviewBtn').textContent='Previsualizar cambio';
+      updateGroupChangePreviewButton();
+    }
   }
 
   async function loadAudit(){
@@ -648,7 +813,8 @@
   $('confirmPhrase').addEventListener('input',()=>{$('confirmCreateBtn').disabled=$('confirmPhrase').value.trim()!=='CREAR'});
   $('cancelCreateBtn').addEventListener('click',closeCreateConfirmation);
   $('confirmCreateBtn').addEventListener('click',executePortalProvisioning);
-  $('navProvision').addEventListener('click',()=>showView('provision'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
+  $('navProvision').addEventListener('click',()=>showView('provision'));$('navGroupChange').addEventListener('click',()=>showView('group-change'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
+  $('groupChangeUser').addEventListener('input',updateGroupChangePreviewButton);$('groupChangeTarget').addEventListener('change',updateGroupChangePreviewButton);$('groupChangePreviewBtn').addEventListener('click',previewGroupChange);
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
   $('togglePass').addEventListener('click',()=>{const f=$('agentPass');const show=f.type==='password';f.type=show?'text':'password';$('togglePass').textContent=show?'Ocultar':'Mostrar'});
   $('demoBtn').addEventListener('click',()=>{$('bulkText').value='Juan Carlos,Pérez,López\nMaría Fernanda,Hernández,Ruiz\nKristian Michell,Maya,Guzmán\nJosé Luis,Hernández,Soto';toast('Ejemplo cargado. Selecciona un grupo con plantilla configurada.')});
