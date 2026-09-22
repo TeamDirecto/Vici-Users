@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.18.3-phones-alias")
+app = FastAPI(title="Vici-Users API", version="0.19.0-group-change")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2371,6 +2371,27 @@ def ensure_inventory_db():
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS group_change_operations (
+                    idempotency_key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    source_user_group TEXT NOT NULL,
+                    target_user_group TEXT NOT NULL,
+                    source_extension TEXT NOT NULL,
+                    target_extension TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    error_text TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_group_change_operations_target "
+                "ON group_change_operations(username, target_extension, status)"
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS auth_sessions (
                     token_hash TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -2738,6 +2759,12 @@ class GroupChangePreviewRequest(BaseModel):
     target_user_group: str = Field(..., min_length=1, max_length=20)
 
 
+class GroupChangeExecuteRequest(GroupChangePreviewRequest):
+    source_extension: str = Field(..., min_length=1, max_length=20)
+    target_extension: str = Field(..., min_length=1, max_length=20)
+    idempotency_key: str = Field(..., min_length=8, max_length=128)
+
+
 @app.post("/api/auth/login")
 def auth_login(payload: LoginRequest, request: Request):
     username = payload.username.strip()
@@ -3015,6 +3042,7 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
     target_group = payload.target_user_group.strip()
 
     require_managed_group(target_group)
+    require_provisioning_group(target_group)
 
     templates = load_group_templates()
     target_template_user = templates.get(target_group)
@@ -3049,6 +3077,16 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
             (target_template_user, target_group),
         )
         target_template = cursor.fetchone()
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+              FROM vicidial_live_agents
+             WHERE user=%s
+            """,
+            (username,),
+        )
+        live_row = cursor.fetchone() or {"total": 0}
 
     if not target_template:
         raise HTTPException(
@@ -3107,24 +3145,46 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
     if str(current.get("active") or "").upper() != "Y":
         blockers.append("USER_NOT_ACTIVE")
 
+    if int(live_row.get("total") or 0) > 0:
+        blockers.append("USER_LOGGED_IN")
+
+    if current_group not in load_extension_ranges():
+        blockers.append("SOURCE_GROUP_NOT_PROVISIONING_MANAGED")
+
+    if not managed_extensions:
+        blockers.append("MANAGED_SOURCE_EXTENSION_REQUIRED")
+    elif len(managed_extensions) > 1:
+        blockers.append("MULTIPLE_MANAGED_EXTENSIONS_UNSUPPORTED")
+
     for item in managed_extensions:
         extension = str(item.get("extension") or "")
         extension_group = str(item.get("user_group") or "")
 
         if extension_group != current_group:
-            warnings.append(
+            blockers.append(
                 "MANAGED_EXTENSION_SOURCE_GROUP_MISMATCH:%s" % extension
             )
-
-        if extension_group != target_group:
+        else:
             warnings.append(
-                "MANAGED_EXTENSION_WOULD_REMAIN_IN_SOURCE_BLOCK:%s" % extension
+                "SOURCE_EXTENSION_WILL_BE_RELEASED:%s" % extension
             )
 
-    status = "READY_PREVIEW" if not blockers else "BLOCKED"
+    unique_blockers = []
+    seen_blockers = set()
+    for blocker in blockers:
+        if blocker not in seen_blockers:
+            unique_blockers.append(blocker)
+            seen_blockers.add(blocker)
+
+    status = "READY_PREVIEW" if not unique_blockers else "BLOCKED"
+    execution_enabled = bool(
+        not unique_blockers
+        and PORTAL_WRITE_ENABLED
+        and CREATE_ENABLED
+    )
 
     return {
-        "mode": "GROUP_CHANGE_PREVIEW_ONLY",
+        "mode": "GROUP_CHANGE_MIGRATION_PREVIEW",
         "write_performed": False,
         "status": status,
         "username": username,
@@ -3153,19 +3213,971 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
             "required_nodes": target_extension_preview.get("required_nodes", 0),
             "templates_ready": target_extension_preview.get("templates_ready", False),
         },
+        "source_extension_policy": {
+            "action": "DEACTIVATE_PHONES_DELETE_ALIAS_MARK_FREE",
+            "managed_extension_required": True,
+        },
         "permission_fields_total": len(USER_CLONE_FIELDS),
         "permission_fields_changed": len(changed_permission_fields),
         "changed_permission_fields": changed_permission_fields,
         "managed_extensions": managed_extensions,
-        "blockers": blockers,
+        "blockers": unique_blockers,
         "warnings": warnings,
-        "execution_enabled": False,
+        "execution_enabled": execution_enabled,
         "execution_note": (
-            "Preview-only. El cambio real todavía no está habilitado; "
-            "la contraseña se reemplazará por el default del grupo destino y "
-            "las extensiones administradas no se modifican en este endpoint."
+            "Al aplicar: se crea una extensión UNCREATED en el grupo destino, "
+            "se heredan permisos y password del BASE destino, se desactiva la "
+            "extensión anterior, se elimina su alias y se marca FREE."
+            if execution_enabled
+            else "La ejecución requiere preview sin bloqueos, sesión admin y portal write habilitado."
         ),
     }
+
+
+def replay_group_change_operation_if_known(payload):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            """
+            SELECT idempotency_key, username, source_user_group,
+                   target_user_group, source_extension, target_extension,
+                   status, result_json
+              FROM group_change_operations
+             WHERE idempotency_key=?
+            """,
+            (payload.idempotency_key,),
+        ).fetchone()
+        if not row:
+            return None
+
+        same_payload = (
+            str(row["username"]) == payload.username.strip().upper()
+            and str(row["target_user_group"]) == payload.target_user_group.strip()
+            and str(row["source_extension"]) == payload.source_extension.strip()
+            and str(row["target_extension"]) == payload.target_extension.strip()
+        )
+        if not same_payload:
+            raise HTTPException(
+                status_code=409,
+                detail="GROUP_CHANGE_IDEMPOTENCY_PAYLOAD_MISMATCH",
+            )
+
+        if str(row["status"]) == "SUCCESS" and row["result_json"]:
+            result = json.loads(row["result_json"])
+            result["replayed"] = True
+            result["credentials_available"] = False
+            return result
+
+        raise HTTPException(
+            status_code=409,
+            detail="GROUP_CHANGE_IDEMPOTENCY_ALREADY_USED:%s" % str(row["status"]),
+        )
+    finally:
+        connection.close()
+
+
+def reserve_group_change_operation(payload, preview):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        existing = connection.execute(
+            """
+            SELECT idempotency_key, username, source_user_group,
+                   target_user_group, source_extension, target_extension,
+                   status, result_json
+              FROM group_change_operations
+             WHERE idempotency_key=?
+            """,
+            (payload.idempotency_key,),
+        ).fetchone()
+        if existing:
+            connection.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="GROUP_CHANGE_IDEMPOTENCY_ALREADY_USED:%s"
+                % str(existing["status"]),
+            )
+
+        source = connection.execute(
+            """
+            SELECT extension, user_group, status, current_user
+              FROM extension_inventory
+             WHERE extension=?
+            """,
+            (payload.source_extension,),
+        ).fetchone()
+        if (
+            not source
+            or str(source["status"]).upper() != "IN_USE"
+            or str(source["current_user"] or "").upper()
+               != payload.username.strip().upper()
+            or str(source["user_group"]) != preview["current_user_group"]
+        ):
+            connection.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="SOURCE_EXTENSION_INVENTORY_CHANGED",
+            )
+
+        target = connection.execute(
+            """
+            SELECT extension, user_group, status, current_user
+              FROM extension_inventory
+             WHERE extension=?
+            """,
+            (payload.target_extension,),
+        ).fetchone()
+        if target:
+            connection.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="TARGET_EXTENSION_ALREADY_MANAGED:%s" % str(target["status"]),
+            )
+
+        connection.execute(
+            """
+            INSERT INTO group_change_operations
+                (idempotency_key, username, source_user_group,
+                 target_user_group, source_extension, target_extension, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'RESERVED')
+            """,
+            (
+                payload.idempotency_key,
+                payload.username.strip().upper(),
+                preview["current_user_group"],
+                payload.target_user_group.strip(),
+                payload.source_extension.strip(),
+                payload.target_extension.strip(),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO extension_inventory
+                (extension, user_group, status, current_user,
+                 reserved_at, updated_at, note)
+            VALUES (?, ?, 'RESERVED', ?, CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP, ?)
+            """,
+            (
+                payload.target_extension.strip(),
+                payload.target_user_group.strip(),
+                payload.username.strip().upper(),
+                "Group change %s" % payload.idempotency_key,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO extension_inventory_events
+                (extension, user_group, event_type, old_status,
+                 new_status, user_name, detail)
+            VALUES (?, ?, 'GROUP_CHANGE_RESERVE', 'UNCREATED', 'RESERVED', ?, ?)
+            """,
+            (
+                payload.target_extension.strip(),
+                payload.target_user_group.strip(),
+                payload.username.strip().upper(),
+                "idempotency_key=%s source_extension=%s"
+                % (payload.idempotency_key, payload.source_extension.strip()),
+            ),
+        )
+        connection.commit()
+    except HTTPException:
+        raise
+    except sqlite3.Error as exc:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="GROUP_CHANGE_RESERVATION_FAILED:%s" % exc.__class__.__name__,
+        )
+    finally:
+        connection.close()
+
+
+def set_group_change_operation_status(idempotency_key, status, error_text=None):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute(
+            """
+            UPDATE group_change_operations
+               SET status=?, error_text=?, updated_at=CURRENT_TIMESTAMP
+             WHERE idempotency_key=?
+            """,
+            (status, error_text, idempotency_key),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def finalize_group_change_inventory(payload, preview, result):
+    username = payload.username.strip().upper()
+    source_group = preview["current_user_group"]
+    target_group = payload.target_user_group.strip()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        target_cursor = connection.execute(
+            """
+            UPDATE extension_inventory
+               SET status='IN_USE', current_user=?,
+                   assigned_at=CURRENT_TIMESTAMP,
+                   updated_at=CURRENT_TIMESTAMP,
+                   note=?
+             WHERE extension=?
+               AND user_group=?
+               AND status='RESERVED'
+               AND current_user=?
+            """,
+            (
+                username,
+                "Group change SUCCESS %s" % payload.idempotency_key,
+                payload.target_extension.strip(),
+                target_group,
+                username,
+            ),
+        )
+        if target_cursor.rowcount != 1:
+            raise RuntimeError("TARGET_RESERVATION_NOT_RESERVED")
+
+        source_cursor = connection.execute(
+            """
+            UPDATE extension_inventory
+               SET status='FREE',
+                   previous_user=current_user,
+                   current_user=NULL,
+                   released_at=CURRENT_TIMESTAMP,
+                   updated_at=CURRENT_TIMESTAMP,
+                   note=?
+             WHERE extension=?
+               AND user_group=?
+               AND status='IN_USE'
+               AND current_user=?
+            """,
+            (
+                "Released by group change %s" % payload.idempotency_key,
+                payload.source_extension.strip(),
+                source_group,
+                username,
+            ),
+        )
+        if source_cursor.rowcount != 1:
+            raise RuntimeError("SOURCE_EXTENSION_NOT_IN_USE")
+
+        connection.execute(
+            """
+            INSERT INTO extension_inventory_events
+                (extension, user_group, event_type, old_status,
+                 new_status, user_name, detail)
+            VALUES (?, ?, 'GROUP_CHANGE_ASSIGN', 'RESERVED', 'IN_USE', ?, ?)
+            """,
+            (
+                payload.target_extension.strip(),
+                target_group,
+                username,
+                "idempotency_key=%s" % payload.idempotency_key,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO extension_inventory_events
+                (extension, user_group, event_type, old_status,
+                 new_status, user_name, detail)
+            VALUES (?, ?, 'GROUP_CHANGE_RELEASE', 'IN_USE', 'FREE', ?, ?)
+            """,
+            (
+                payload.source_extension.strip(),
+                source_group,
+                username,
+                "idempotency_key=%s target_extension=%s"
+                % (payload.idempotency_key, payload.target_extension.strip()),
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE group_change_operations
+               SET status='SUCCESS', result_json=?, error_text=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+             WHERE idempotency_key=?
+               AND status='RUNNING'
+            """,
+            (
+                json.dumps(result, sort_keys=True),
+                payload.idempotency_key,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def release_group_change_reservation(payload, error_text, compensation_ok):
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if compensation_ok:
+            connection.execute(
+                """
+                DELETE FROM extension_inventory
+                 WHERE extension=?
+                   AND user_group=?
+                   AND status='RESERVED'
+                   AND current_user=?
+                """,
+                (
+                    payload.target_extension.strip(),
+                    payload.target_user_group.strip(),
+                    payload.username.strip().upper(),
+                ),
+            )
+            status = "COMPENSATED"
+        else:
+            connection.execute(
+                """
+                UPDATE extension_inventory
+                   SET status='ERROR', note=?, updated_at=CURRENT_TIMESTAMP
+                 WHERE extension=?
+                   AND user_group=?
+                   AND status='RESERVED'
+                """,
+                (
+                    "Group change compensation failed: %s" % error_text[:300],
+                    payload.target_extension.strip(),
+                    payload.target_user_group.strip(),
+                ),
+            )
+            status = "ERROR"
+
+        connection.execute(
+            """
+            UPDATE group_change_operations
+               SET status=?, error_text=?, updated_at=CURRENT_TIMESTAMP
+             WHERE idempotency_key=?
+            """,
+            (status, error_text[:1000], payload.idempotency_key),
+        )
+        connection.commit()
+    except sqlite3.Error:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def group_change_target_write_plan(preview, payload):
+    plan = provisioning_write_plan(
+        payload.target_user_group.strip(),
+        payload.username.strip().upper(),
+        preview["full_name"],
+        payload.target_extension.strip(),
+    )
+    blockers = [
+        blocker for blocker in plan.get("blockers", [])
+        if blocker != "TARGET_USER_ALREADY_EXISTS"
+    ]
+    plan["blockers"] = blockers
+    plan["status"] = "READY" if not blockers else "BLOCKED"
+    return plan
+
+
+def compensate_group_change_mysql(
+    payload,
+    preview,
+    inserted_phones,
+    target_alias_created,
+    target_alias_logins,
+    user_snapshot,
+    user_updated,
+    source_phone_snapshot,
+    source_deactivated,
+    source_alias_snapshot,
+    source_alias_deleted,
+):
+    errors = []
+    connection = None
+    try:
+        cfg = db_config()
+        cfg["autocommit"] = True
+        connection = pymysql.connect(**cfg)
+        cursor = connection.cursor()
+
+        if user_updated and user_snapshot:
+            restore_fields = [
+                "pass", "full_name", "user_level", "user_group", "active"
+            ] + list(USER_CLONE_FIELDS)
+            restore_sql = ", ".join(
+                "`%s`=%%s" % field for field in restore_fields
+            )
+            params = [user_snapshot.get(field) for field in restore_fields]
+            params.append(payload.username.strip().upper())
+            cursor.execute(
+                "UPDATE vicidial_users SET %s WHERE user=%%s" % restore_sql,
+                tuple(params),
+            )
+            if cursor.rowcount not in (0, 1):
+                errors.append("USER_RESTORE_ROWCOUNT:%s" % cursor.rowcount)
+
+        if source_deactivated:
+            for row in source_phone_snapshot:
+                cursor.execute(
+                    """
+                    UPDATE phones
+                       SET active=%s
+                     WHERE extension=%s
+                       AND server_ip=%s
+                       AND login=%s
+                       AND user_group=%s
+                    """,
+                    (
+                        row.get("active"),
+                        payload.source_extension.strip(),
+                        row.get("server_ip"),
+                        row.get("login"),
+                        preview["current_user_group"],
+                    ),
+                )
+
+        if source_alias_deleted and source_alias_snapshot:
+            cursor.execute(
+                "SELECT alias_id FROM phones_alias WHERE alias_id=%s LIMIT 1",
+                (payload.source_extension.strip(),),
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    """
+                    INSERT INTO phones_alias
+                        (alias_id, alias_name, logins_list, user_group)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        source_alias_snapshot.get("alias_id"),
+                        source_alias_snapshot.get("alias_name"),
+                        source_alias_snapshot.get("logins_list"),
+                        source_alias_snapshot.get("user_group"),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    errors.append(
+                        "SOURCE_ALIAS_RESTORE_ROWCOUNT:%s" % cursor.rowcount
+                    )
+
+        if target_alias_created:
+            cursor.execute(
+                """
+                DELETE FROM phones_alias
+                 WHERE alias_id=%s
+                   AND alias_name=%s
+                   AND logins_list=%s
+                   AND user_group='---ALL---'
+                """,
+                (
+                    payload.target_extension.strip(),
+                    payload.target_extension.strip(),
+                    str(target_alias_logins or ""),
+                ),
+            )
+            if cursor.rowcount not in (0, 1):
+                errors.append(
+                    "TARGET_ALIAS_COMPENSATION_ROWCOUNT:%s" % cursor.rowcount
+                )
+
+        for item in reversed(inserted_phones):
+            cursor.execute(
+                """
+                DELETE FROM phones
+                 WHERE extension=%s
+                   AND server_ip=%s
+                   AND login=%s
+                   AND user_group=%s
+                """,
+                (
+                    payload.target_extension.strip(),
+                    item["server_ip"],
+                    item["login"],
+                    payload.target_user_group.strip(),
+                ),
+            )
+            if cursor.rowcount not in (0, 1):
+                errors.append(
+                    "TARGET_PHONE_COMPENSATION_ROWCOUNT:%s:%s"
+                    % (item["server_ip"], cursor.rowcount)
+                )
+    except Exception as exc:
+        errors.append(
+            "GROUP_CHANGE_COMPENSATION_CONNECTION:%s" % exc.__class__.__name__
+        )
+    finally:
+        if connection:
+            connection.close()
+    return errors
+
+
+def execute_group_change(payload, preview):
+    username = payload.username.strip().upper()
+    target_group = payload.target_user_group.strip()
+    source_group = preview["current_user_group"]
+    source_extension = payload.source_extension.strip()
+    target_extension = payload.target_extension.strip()
+
+    if preview.get("status") != "READY_PREVIEW" or preview.get("blockers"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "GROUP_CHANGE_PREVIEW_BLOCKED",
+                "blockers": preview.get("blockers") or [],
+            },
+        )
+
+    managed = preview.get("managed_extensions") or []
+    if len(managed) != 1 or str(managed[0].get("extension") or "") != source_extension:
+        raise HTTPException(
+            status_code=409,
+            detail="SOURCE_EXTENSION_PREVIEW_MISMATCH",
+        )
+
+    allocation = preview.get("target_extension_allocation") or {}
+    if str(allocation.get("extension") or "") != target_extension:
+        raise HTTPException(
+            status_code=409,
+            detail="TARGET_EXTENSION_PREVIEW_MISMATCH",
+        )
+
+    target_password = resolve_agent_password(target_group)
+    plan = group_change_target_write_plan(preview, payload)
+    if plan.get("status") != "READY":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "GROUP_CHANGE_WRITE_PLAN_BLOCKED",
+                "blockers": plan.get("blockers") or [],
+                "warnings": plan.get("warnings") or [],
+            },
+        )
+
+    reserve_group_change_operation(payload, preview)
+    set_group_change_operation_status(payload.idempotency_key, "RUNNING")
+
+    inserted_phones = []
+    target_alias_created = False
+    target_alias_logins = None
+    user_snapshot = None
+    user_updated = False
+    source_phone_snapshot = []
+    source_deactivated = False
+    source_alias_snapshot = None
+    source_alias_deleted = False
+    connection = None
+
+    try:
+        cfg = db_config()
+        cfg["autocommit"] = True
+        connection = pymysql.connect(**cfg)
+        cursor = connection.cursor()
+
+        user_snapshot_fields = [
+            "user", "pass", "full_name", "user_level", "user_group", "active"
+        ] + list(USER_CLONE_FIELDS)
+        user_snapshot_sql = ", ".join(
+            "`%s`" % field for field in user_snapshot_fields
+        )
+        cursor.execute(
+            "SELECT %s FROM vicidial_users WHERE user=%%s LIMIT 1"
+            % user_snapshot_sql,
+            (username,),
+        )
+        user_snapshot = cursor.fetchone()
+        if not user_snapshot:
+            raise RuntimeError("GROUP_CHANGE_USER_DISAPPEARED")
+        if str(user_snapshot.get("user_group") or "") != source_group:
+            raise RuntimeError("GROUP_CHANGE_SOURCE_GROUP_CHANGED")
+        if str(user_snapshot.get("active") or "").upper() != "Y":
+            raise RuntimeError("GROUP_CHANGE_USER_NOT_ACTIVE")
+
+        target_template_user = preview["target_template_user"]
+        template_fields = ["user"] + list(USER_CLONE_FIELDS)
+        template_sql = ", ".join("`%s`" % field for field in template_fields)
+        cursor.execute(
+            """
+            SELECT %s
+              FROM vicidial_users
+             WHERE user=%%s
+               AND user_group=%%s
+             LIMIT 1
+            """ % template_sql,
+            (target_template_user, target_group),
+        )
+        target_template = cursor.fetchone()
+        if not target_template:
+            raise RuntimeError("GROUP_CHANGE_TARGET_TEMPLATE_DISAPPEARED")
+
+        cursor.execute(
+            """
+            SELECT extension, server_ip, login, active, user_group
+              FROM phones
+             WHERE extension=%s
+               AND user_group=%s
+             ORDER BY server_ip
+            """,
+            (source_extension, source_group),
+        )
+        source_phone_snapshot = cursor.fetchall()
+        if not source_phone_snapshot:
+            raise RuntimeError("GROUP_CHANGE_SOURCE_PHONES_MISSING")
+
+        source_identity = canonical_phone_plan(source_group, source_extension)
+        source_enabled_servers = set(
+            node["server_ip"]
+            for node in source_identity["nodes"]
+            if node["enabled"]
+        )
+        source_active_servers = set(
+            str(row.get("server_ip") or "")
+            for row in source_phone_snapshot
+            if str(row.get("active") or "").upper() == "Y"
+        )
+        if not source_enabled_servers.issubset(source_active_servers):
+            raise RuntimeError("GROUP_CHANGE_SOURCE_PHONES_NOT_ACTIVE_ON_REQUIRED_NODES")
+
+        cursor.execute(
+            """
+            SELECT alias_id, alias_name, logins_list, user_group
+              FROM phones_alias
+             WHERE alias_id=%s
+             LIMIT 1
+            """,
+            (source_extension,),
+        )
+        source_alias_snapshot = cursor.fetchone()
+
+        for node_plan in plan["phones_plan"]:
+            if node_plan.get("status") != "READY":
+                continue
+            params = [
+                item["value"]
+                for item in node_plan["safe_parameters_in_order"]
+            ]
+            cursor.execute(node_plan["sql_template"], tuple(params))
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "GROUP_CHANGE_PHONE_INSERT_ROWCOUNT:%s:%s"
+                    % (node_plan["server_ip"], cursor.rowcount)
+                )
+            target_login = None
+            for changed in node_plan["changed_fields"]:
+                if changed["field"] == "login":
+                    target_login = changed["to"]
+                    break
+            inserted_phones.append({
+                "server_ip": node_plan["server_ip"],
+                "login": target_login,
+            })
+
+        target_payload = ProvisioningExecuteRequest(
+            user_group=target_group,
+            username=username,
+            full_name=preview["full_name"],
+            extension=target_extension,
+            idempotency_key="GROUP-CHANGE-VALIDATION",
+        )
+        target_identity = canonical_phone_plan(target_group, target_extension)
+        validate_created_phones(cursor, target_payload, target_identity, "N")
+
+        alias_plan = plan["phone_alias_plan"]
+        cursor.execute(
+            alias_plan["sql_template"],
+            tuple(alias_plan["safe_parameters_in_order"]),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "GROUP_CHANGE_TARGET_ALIAS_INSERT_ROWCOUNT:%s" % cursor.rowcount
+            )
+        target_alias_created = True
+        target_alias_logins = alias_plan["logins_list"]
+        validate_created_phone_alias(cursor, target_payload, target_identity)
+
+        update_fields = ["pass", "user_level", "user_group"] + list(USER_CLONE_FIELDS)
+        update_sql = ", ".join("`%s`=%%s" % field for field in update_fields)
+        update_values = [target_password, 1, target_group] + [
+            target_template.get(field) for field in USER_CLONE_FIELDS
+        ]
+        update_values.extend([username, source_group])
+        cursor.execute(
+            """
+            UPDATE vicidial_users
+               SET %s
+             WHERE user=%%s
+               AND user_group=%%s
+               AND active='Y'
+            """ % update_sql,
+            tuple(update_values),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "GROUP_CHANGE_USER_UPDATE_ROWCOUNT:%s" % cursor.rowcount
+            )
+        user_updated = True
+
+        enabled_servers = [
+            node["server_ip"]
+            for node in target_identity["nodes"]
+            if node["enabled"]
+        ]
+        placeholders = ",".join(["%s"] * len(enabled_servers))
+        cursor.execute(
+            (
+                "UPDATE phones SET active='Y' "
+                "WHERE extension=%s AND user_group=%s "
+                "AND server_ip IN (" + placeholders + ")"
+            ),
+            tuple([target_extension, target_group] + enabled_servers),
+        )
+        if cursor.rowcount != len(enabled_servers):
+            raise RuntimeError(
+                "GROUP_CHANGE_TARGET_PHONE_ACTIVATE_ROWCOUNT expected=%d actual=%d"
+                % (len(enabled_servers), cursor.rowcount)
+            )
+
+        cursor.execute(
+            """
+            UPDATE phones
+               SET active='N'
+             WHERE extension=%s
+               AND user_group=%s
+               AND active='Y'
+            """,
+            (source_extension, source_group),
+        )
+        if cursor.rowcount < len(source_enabled_servers):
+            raise RuntimeError(
+                "GROUP_CHANGE_SOURCE_PHONE_DEACTIVATE_ROWCOUNT expected_at_least=%d actual=%d"
+                % (len(source_enabled_servers), cursor.rowcount)
+            )
+        source_deactivated = True
+
+        if source_alias_snapshot:
+            cursor.execute(
+                "DELETE FROM phones_alias WHERE alias_id=%s",
+                (source_extension,),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "GROUP_CHANGE_SOURCE_ALIAS_DELETE_ROWCOUNT:%s" % cursor.rowcount
+                )
+            source_alias_deleted = True
+
+        final_phones = validate_created_phones(
+            cursor,
+            target_payload,
+            target_identity,
+            "Y",
+        )
+        final_alias = validate_created_phone_alias(
+            cursor,
+            target_payload,
+            target_identity,
+        )
+
+        final_user_fields = [
+            "user", "full_name", "user_level", "user_group", "active", "pass"
+        ] + list(USER_CLONE_FIELDS)
+        final_user_sql = ", ".join(
+            "`%s`" % field for field in final_user_fields
+        )
+        cursor.execute(
+            "SELECT %s FROM vicidial_users WHERE user=%%s LIMIT 1"
+            % final_user_sql,
+            (username,),
+        )
+        final_user = cursor.fetchone()
+        if not final_user:
+            raise RuntimeError("GROUP_CHANGE_FINAL_USER_MISSING")
+        if str(final_user.get("full_name") or "") != str(user_snapshot.get("full_name") or ""):
+            raise RuntimeError("GROUP_CHANGE_FULL_NAME_NOT_PRESERVED")
+        if str(final_user.get("user_group") or "") != target_group:
+            raise RuntimeError("GROUP_CHANGE_FINAL_GROUP_MISMATCH")
+        if int(final_user.get("user_level") or 0) != 1:
+            raise RuntimeError("GROUP_CHANGE_FINAL_LEVEL_MISMATCH")
+        if str(final_user.get("active") or "").upper() != "Y":
+            raise RuntimeError("GROUP_CHANGE_FINAL_ACTIVE_MISMATCH")
+        if final_user.get("pass") != target_password:
+            raise RuntimeError("GROUP_CHANGE_FINAL_PASSWORD_MISMATCH")
+        for field in USER_CLONE_FIELDS:
+            if final_user.get(field) != target_template.get(field):
+                raise RuntimeError(
+                    "GROUP_CHANGE_PERMISSION_MISMATCH:%s" % field
+                )
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total
+              FROM phones
+             WHERE extension=%s
+               AND user_group=%s
+               AND active='Y'
+            """,
+            (source_extension, source_group),
+        )
+        if int((cursor.fetchone() or {}).get("total") or 0) != 0:
+            raise RuntimeError("GROUP_CHANGE_SOURCE_PHONE_STILL_ACTIVE")
+
+        if source_alias_snapshot:
+            cursor.execute(
+                "SELECT COUNT(*) AS total FROM phones_alias WHERE alias_id=%s",
+                (source_extension,),
+            )
+            if int((cursor.fetchone() or {}).get("total") or 0) != 0:
+                raise RuntimeError("GROUP_CHANGE_SOURCE_ALIAS_STILL_PRESENT")
+
+        result = {
+            "status": "SUCCESS",
+            "write_performed": True,
+            "operation": "GROUP_CHANGE",
+            "idempotency_key": payload.idempotency_key,
+            "username": username,
+            "full_name": preview["full_name"],
+            "source_user_group": source_group,
+            "target_user_group": target_group,
+            "source_extension": source_extension,
+            "target_extension": target_extension,
+            "extension": target_extension,
+            "required_nodes": len(final_phones),
+            "phone_alias": {
+                "alias_id": str(final_alias.get("alias_id") or ""),
+                "logins_list": str(final_alias.get("logins_list") or ""),
+            },
+            "source_extension_status": "FREE",
+            "asterisk_sync_pending": True,
+            "credentials_available": False,
+        }
+
+        finalize_group_change_inventory(payload, preview, result)
+        return result
+
+    except Exception as exc:
+        error_text = "%s:%s" % (exc.__class__.__name__, str(exc))
+        compensation_errors = compensate_group_change_mysql(
+            payload,
+            preview,
+            inserted_phones,
+            target_alias_created,
+            target_alias_logins,
+            user_snapshot,
+            user_updated,
+            source_phone_snapshot,
+            source_deactivated,
+            source_alias_snapshot,
+            source_alias_deleted,
+        )
+        compensation_ok = len(compensation_errors) == 0
+        release_group_change_reservation(
+            payload,
+            error_text,
+            compensation_ok,
+        )
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "GROUP_CHANGE_FAILED",
+                "error": error_text[:500],
+                "compensation_ok": compensation_ok,
+                "compensation_errors": compensation_errors,
+            },
+        )
+    finally:
+        if connection:
+            connection.close()
+
+
+@app.post("/api/users/group-change/execute")
+def group_change_execute_route(
+    payload: GroupChangeExecuteRequest,
+    request: Request,
+):
+    session = require_portal_write_gate(request)
+
+    if not re.match(r"^[A-Za-z0-9._:-]+$", payload.idempotency_key):
+        raise HTTPException(
+            status_code=400,
+            detail="idempotency_key contiene caracteres no permitidos",
+        )
+
+    replay = replay_group_change_operation_if_known(payload)
+    if replay is not None:
+        replay["requested_by"] = session["username"]
+        replay["request_source"] = "PORTAL"
+        return replay
+
+    preview = group_change_preview(
+        GroupChangePreviewRequest(
+            username=payload.username,
+            target_user_group=payload.target_user_group,
+        ),
+        request,
+    )
+
+    audit_detail = (
+        "idempotency_key=%s username=%s source_group=%s target_group=%s "
+        "source_extension=%s target_extension=%s"
+        % (
+            payload.idempotency_key,
+            payload.username.strip().upper(),
+            preview.get("current_user_group"),
+            payload.target_user_group.strip(),
+            payload.source_extension.strip(),
+            payload.target_extension.strip(),
+        )
+    )
+    record_auth_event(
+        session["username"],
+        "GROUP_CHANGE_REQUEST",
+        request,
+        audit_detail,
+    )
+
+    try:
+        result = execute_group_change(payload, preview)
+    except HTTPException as exc:
+        record_auth_event(
+            session["username"],
+            "GROUP_CHANGE_FAILED",
+            request,
+            audit_detail + " http_status=%s" % exc.status_code,
+        )
+        raise
+
+    # La contraseña se expone sólo en esta respuesta web. Nunca se persiste
+    # en group_change_operations ni en auth_audit.
+    target_password = resolve_agent_password(payload.target_user_group.strip())
+    result["credentials_available"] = True
+    result["credentials"] = {
+        "username": payload.username.strip().upper(),
+        "password": target_password,
+        "phone": payload.target_extension.strip(),
+    }
+    result["requested_by"] = session["username"]
+    result["request_source"] = "PORTAL"
+
+    record_auth_event(
+        session["username"],
+        "GROUP_CHANGE_SUCCESS",
+        request,
+        audit_detail,
+    )
+    return result
 
 
 @app.get("/api/users/{user}")
