@@ -28,10 +28,10 @@
     },
     {
       "server_ip": "172.20.21.94",
-      "enabled": false,
+      "enabled": true,
       "login_suffix": "e",
       "dialplan_prefix": "4",
-      "note": "Excluido temporalmente por problemas de registro de extensiones"
+      "note": "Rehabilitado para provisión canonical-v1; nodo obligatorio 5/5"
     }
   ]
 }
