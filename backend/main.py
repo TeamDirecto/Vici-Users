@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.18.2-group-change-extension-preview")
+app = FastAPI(title="Vici-Users API", version="0.18.3-phones-alias")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -609,10 +609,22 @@ def canonical_phone_plan(user_group, extension):
     }
 
 
+def expected_phone_alias(identity):
+    enabled_nodes = [node for node in identity["nodes"] if node["enabled"]]
+    extension_text = str(identity["extension"])
+    return {
+        "alias_id": extension_text,
+        "alias_name": extension_text,
+        "logins_list": ",".join(node["login"] for node in enabled_nodes),
+        "user_group": "---ALL---",
+    }
+
+
 def phone_provisioning_dry_run(user_group, extension):
     extension_range = require_provisioning_group(user_group)
     identity = canonical_phone_plan(user_group, extension)
     extension_text = identity["extension"]
+    alias_expected = expected_phone_alias(identity)
     range_start = str(extension_range["start"])
     range_end = str(extension_range["end"])
 
@@ -631,6 +643,17 @@ def phone_provisioning_dry_run(user_group, extension):
             (extension_text,),
         )
         existing_extension_rows = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT alias_id, alias_name, logins_list, user_group
+              FROM phones_alias
+             WHERE alias_id=%s
+             LIMIT 1
+            """,
+            (extension_text,),
+        )
+        existing_alias = cursor.fetchone()
 
         login_placeholders = ",".join(["%s"] * len(all_logins))
         cursor.execute(
@@ -729,6 +752,8 @@ def phone_provisioning_dry_run(user_group, extension):
 
     if existing_extension_rows:
         blockers.append("TARGET_EXTENSION_ALREADY_EXISTS")
+    if existing_alias:
+        blockers.append("TARGET_PHONE_ALIAS_ALREADY_EXISTS")
 
     enabled_logins = set(node["login"] for node in enabled_nodes)
     enabled_dialplans = set(node["dialplan_number"] for node in enabled_nodes)
@@ -770,8 +795,10 @@ def phone_provisioning_dry_run(user_group, extension):
         "required_nodes": identity["required_nodes"],
         "storage_engine": "MyISAM",
         "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
+        "phone_alias": alias_expected,
         "precheck": {
             "extension_unused": not bool(existing_extension_rows),
+            "phone_alias_unused": not bool(existing_alias),
             "enabled_login_collisions": len(enabled_login_collisions),
             "enabled_dialplan_collisions": len(enabled_dialplan_collisions),
             "templates_ready": all(
@@ -815,6 +842,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
         blockers.append("DEFAULT_PASSWORD_NOT_CONFIGURED")
 
     identity = canonical_phone_plan(user_group, extension_text)
+    alias_expected = expected_phone_alias(identity)
     enabled_identity = dict(
         (node["server_ip"], node)
         for node in identity["nodes"]
@@ -1081,6 +1109,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
         "extension": extension_text,
         "storage_engines": {
             "phones": "MyISAM",
+            "phones_alias": "MyISAM",
             "vicidial_users": "MyISAM",
         },
         "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
@@ -1113,16 +1142,35 @@ def provisioning_write_plan(user_group, username, full_name, extension):
             ),
         },
         "phones_plan": phone_nodes,
+        "phone_alias_plan": {
+            "alias_id": alias_expected["alias_id"],
+            "alias_name": alias_expected["alias_name"],
+            "logins_list": alias_expected["logins_list"],
+            "user_group": alias_expected["user_group"],
+            "sql_template": (
+                "INSERT INTO phones_alias "
+                "(alias_id, alias_name, logins_list, user_group) "
+                "VALUES (%s, %s, %s, %s)"
+            ),
+            "safe_parameters_in_order": [
+                alias_expected["alias_id"],
+                alias_expected["alias_name"],
+                alias_expected["logins_list"],
+                alias_expected["user_group"],
+            ],
+        },
         "operation_order": [
-            "REVALIDATE_TARGET_USER_AND_EXTENSION",
+            "REVALIDATE_TARGET_USER_EXTENSION_AND_ALIAS",
             "RESERVE_EXTENSION_IN_LOCAL_INVENTORY",
             "INSERT_REQUIRED_PHONES_AS_ACTIVE_N",
             "VALIDATE_REQUIRED_PHONES",
+            "INSERT_PHONE_ALIAS",
+            "VALIDATE_PHONE_ALIAS",
             "INSERT_USER_AS_ACTIVE_N",
             "VALIDATE_USER",
             "ACTIVATE_REQUIRED_PHONES",
             "ACTIVATE_USER",
-            "VALIDATE_FINAL_USER_AND_PHONES",
+            "VALIDATE_FINAL_USER_PHONES_AND_ALIAS",
             "MARK_EXTENSION_IN_USE",
         ],
         "activation_sql": {
@@ -1134,6 +1182,10 @@ def provisioning_write_plan(user_group, username, full_name, extension):
         },
         "compensation_sql": {
             "phones": rollback_phones_sql,
+            "phone_alias": (
+                "DELETE FROM phones_alias WHERE alias_id=%s AND alias_name=%s "
+                "AND logins_list=%s AND user_group=%s"
+            ),
             "user": (
                 "DELETE FROM vicidial_users "
                 "WHERE user=%s AND user_group=%s"
@@ -1167,6 +1219,12 @@ def extension_candidate_pool(user_group):
             tuple(extensions),
         )
         phone_rows = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT alias_id FROM phones_alias WHERE alias_id IN (%s)" % placeholders,
+            tuple(extensions),
+        )
+        alias_ids = set(str(row.get("alias_id") or "") for row in cursor.fetchall())
 
     phones_by_extension = dict((extension, []) for extension in extensions)
     for row in phone_rows:
@@ -1206,7 +1264,7 @@ def extension_candidate_pool(user_group):
                 })
             continue
 
-        if not rows:
+        if not rows and extension not in alias_ids:
             uncreated_candidates.append({
                 "extension": extension,
                 "source": "UNCREATED",
@@ -1837,7 +1895,34 @@ def validate_created_phones(cursor, payload, identity, expected_active):
     return rows
 
 
-def compensate_provisioning(payload, inserted_phones, user_inserted):
+def validate_created_phone_alias(cursor, payload, identity):
+    expected = expected_phone_alias(identity)
+    cursor.execute(
+        """
+        SELECT alias_id, alias_name, logins_list, user_group
+          FROM phones_alias
+         WHERE alias_id=%s
+         LIMIT 1
+        """,
+        (payload.extension,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise RuntimeError("PHONE_ALIAS_NOT_FOUND_AFTER_INSERT")
+
+    for field in ("alias_id", "alias_name", "logins_list", "user_group"):
+        if str(row.get(field) or "") != str(expected[field]):
+            raise RuntimeError("PHONE_ALIAS_%s_MISMATCH" % field.upper())
+    return row
+
+
+def compensate_provisioning(
+    payload,
+    inserted_phones,
+    user_inserted,
+    alias_created=False,
+    alias_logins=None,
+):
     errors = []
     cfg = db_config()
     cfg["autocommit"] = True
@@ -1864,6 +1949,25 @@ def compensate_provisioning(payload, inserted_phones, user_inserted):
                 )
             except pymysql.MySQLError as exc:
                 errors.append("USER_COMPENSATION:%s" % exc.__class__.__name__)
+
+        if alias_created:
+            try:
+                cursor.execute(
+                    """
+                    DELETE FROM phones_alias
+                     WHERE alias_id=%s
+                       AND alias_name=%s
+                       AND logins_list=%s
+                       AND user_group='---ALL---'
+                    """,
+                    (
+                        payload.extension,
+                        payload.extension,
+                        str(alias_logins or ""),
+                    ),
+                )
+            except pymysql.MySQLError as exc:
+                errors.append("PHONE_ALIAS_COMPENSATION:%s" % exc.__class__.__name__)
 
         for item in reversed(inserted_phones):
             try:
@@ -1952,6 +2056,8 @@ def execute_provisioning(payload, expose_credentials=False):
     identity = canonical_phone_plan(payload.user_group, payload.extension)
 
     inserted_phones = []
+    alias_created = False
+    alias_logins = None
     user_inserted = False
     connection = None
 
@@ -1985,12 +2091,21 @@ def execute_provisioning(payload, expose_credentials=False):
                 "login": target_login,
             })
 
-        staged_rows = validate_created_phones(
+        validate_created_phones(
             cursor,
             payload,
             identity,
             "N",
         )
+
+        alias_plan = recheck["phone_alias_plan"]
+        alias_params = list(alias_plan["safe_parameters_in_order"])
+        cursor.execute(alias_plan["sql_template"], tuple(alias_params))
+        if cursor.rowcount != 1:
+            raise RuntimeError("PHONE_ALIAS_INSERT_ROWCOUNT:%s" % cursor.rowcount)
+        alias_created = True
+        alias_logins = alias_plan["logins_list"]
+        validate_created_phone_alias(cursor, payload, identity)
 
         user_params = list(recheck["user_plan"]["safe_parameters_in_order"])
         user_params[1] = agent_password
@@ -2070,6 +2185,7 @@ def execute_provisioning(payload, expose_credentials=False):
             identity,
             "Y",
         )
+        final_alias = validate_created_phone_alias(cursor, payload, identity)
         cursor.execute(
             """
             SELECT user, full_name, user_level, user_group, active
@@ -2101,6 +2217,12 @@ def execute_provisioning(payload, expose_credentials=False):
                 }
                 for row in final_rows
             ],
+            "phone_alias": {
+                "alias_id": str(final_alias.get("alias_id") or ""),
+                "alias_name": str(final_alias.get("alias_name") or ""),
+                "logins_list": str(final_alias.get("logins_list") or ""),
+                "user_group": str(final_alias.get("user_group") or ""),
+            },
             "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
         }
 
@@ -2128,6 +2250,8 @@ def execute_provisioning(payload, expose_credentials=False):
             payload,
             inserted_phones,
             user_inserted,
+            alias_created=alias_created,
+            alias_logins=alias_logins,
         )
         compensation_ok = not compensation_errors
         error_text = "%s:%s" % (exc.__class__.__name__, str(exc))
