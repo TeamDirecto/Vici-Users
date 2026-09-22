@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.17.1-ephemeral-credentials")
+app = FastAPI(title="Vici-Users API", version="0.18.0-group-change-preview")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2606,6 +2606,11 @@ class ProvisioningExecuteRequest(WritePlanRequest):
     agent_pass: Optional[str] = Field(None, min_length=1, max_length=100)
 
 
+class GroupChangePreviewRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=20)
+    target_user_group: str = Field(..., min_length=1, max_length=20)
+
+
 @app.post("/api/auth/login")
 def auth_login(payload: LoginRequest, request: Request):
     username = payload.username.strip()
@@ -2873,6 +2878,137 @@ def group_users(user_group, request: Request):
             (user_group,),
         )
         return {"user_group": user_group, "users": cursor.fetchall()}
+
+
+@app.post("/api/users/group-change/preview")
+def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
+    require_operator_session(request, allowed_roles={"admin"})
+
+    username = payload.username.strip().upper()
+    target_group = payload.target_user_group.strip()
+
+    require_managed_group(target_group)
+
+    templates = load_group_templates()
+    target_template_user = templates.get(target_group)
+    if not target_template_user:
+        raise HTTPException(
+            status_code=409,
+            detail="TARGET_GROUP_TEMPLATE_NOT_CONFIGURED",
+        )
+
+    safe_fields = ["user", "full_name", "user_level", "user_group", "active"]
+    select_fields = safe_fields + list(USER_CLONE_FIELDS)
+    select_sql = ", ".join("`%s`" % field for field in select_fields)
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT %s FROM vicidial_users WHERE user=%%s LIMIT 1" % select_sql,
+            (username,),
+        )
+        current = cursor.fetchone()
+
+        if not current:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+
+        cursor.execute(
+            """
+            SELECT %s
+              FROM vicidial_users
+             WHERE user=%%s
+               AND user_group=%%s
+             LIMIT 1
+            """ % select_sql,
+            (target_template_user, target_group),
+        )
+        target_template = cursor.fetchone()
+
+    if not target_template:
+        raise HTTPException(
+            status_code=409,
+            detail="TARGET_GROUP_TEMPLATE_ROW_MISSING",
+        )
+
+    current_group = str(current.get("user_group") or "")
+    changed_permission_fields = []
+    for field in USER_CLONE_FIELDS:
+        if current.get(field) != target_template.get(field):
+            changed_permission_fields.append(field)
+
+    managed_extensions = []
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            """
+            SELECT extension, user_group, status, current_user
+              FROM extension_inventory
+             WHERE current_user=?
+               AND status='IN_USE'
+             ORDER BY extension
+            """,
+            (username,),
+        ).fetchall()
+        managed_extensions = [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+    blockers = []
+    warnings = []
+
+    if current_group == target_group:
+        blockers.append("SAME_GROUP")
+
+    if str(current.get("active") or "").upper() != "Y":
+        blockers.append("USER_NOT_ACTIVE")
+
+    for item in managed_extensions:
+        extension = str(item.get("extension") or "")
+        extension_group = str(item.get("user_group") or "")
+
+        if extension_group != current_group:
+            warnings.append(
+                "MANAGED_EXTENSION_SOURCE_GROUP_MISMATCH:%s" % extension
+            )
+
+        if extension_group != target_group:
+            warnings.append(
+                "MANAGED_EXTENSION_WOULD_REMAIN_IN_SOURCE_BLOCK:%s" % extension
+            )
+
+    status = "READY_PREVIEW" if not blockers else "BLOCKED"
+
+    return {
+        "mode": "GROUP_CHANGE_PREVIEW_ONLY",
+        "write_performed": False,
+        "status": status,
+        "username": username,
+        "full_name": str(current.get("full_name") or ""),
+        "active": str(current.get("active") or ""),
+        "current_user_group": current_group,
+        "current_user_level": int(current.get("user_level") or 0),
+        "target_user_group": target_group,
+        "target_user_level": 1,
+        "target_template_user": target_template_user,
+        "preserved_fields": [
+            "user",
+            "pass",
+            "full_name",
+            "active",
+        ],
+        "permission_fields_total": len(USER_CLONE_FIELDS),
+        "permission_fields_changed": len(changed_permission_fields),
+        "changed_permission_fields": changed_permission_fields,
+        "managed_extensions": managed_extensions,
+        "blockers": blockers,
+        "warnings": warnings,
+        "execution_enabled": False,
+        "execution_note": (
+            "Preview-only. El cambio real todavía no está habilitado; "
+            "las extensiones administradas no se modifican en este endpoint."
+        ),
+    }
 
 
 @app.get("/api/users/{user}")
