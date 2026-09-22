@@ -101,9 +101,9 @@
             </div>
             <div class="rule">
               <strong>Qué se conservaría</strong><br>
-              Username, contraseña, nombre y estado activo.<br><br>
+              Username, nombre y estado activo.<br><br>
               <strong>Qué se actualizaría</strong><br>
-              User Group, user level y permisos heredados del BASE_* destino.
+              User Group, user level, permisos heredados del BASE_* destino y contraseña default del grupo nuevo.
             </div>
             <div class="btns">
               <button class="btn primary" id="groupChangePreviewBtn" disabled>Previsualizar cambio</button>
@@ -124,6 +124,7 @@
               <div><span>Grupo destino</span><strong id="gcTargetGroup">—</strong></div>
               <div><span>BASE destino</span><strong id="gcBase">—</strong></div>
               <div><span>User level destino</span><strong id="gcLevel">—</strong></div>
+              <div><span>Contraseña destino</span><strong id="gcPasswordAction">—</strong></div>
               <div><span>Extensión administrada</span><strong id="gcExtension">—</strong></div>
               <div><span>Permisos que cambiarían</span><strong id="gcPermissionCount">—</strong></div>
             </div>
@@ -713,6 +714,10 @@
       $('gcTargetGroup').textContent=data.target_user_group||'—';
       $('gcBase').textContent=data.target_template_user||'—';
       $('gcLevel').textContent=String(data.target_user_level||'—');
+      const passwordChange=data.password_change||{};
+      $('gcPasswordAction').textContent=passwordChange.target_default_configured
+        ? 'Reemplazar por default del grupo destino'
+        : '⚠ Default no configurado';
 
       const extensions=(data.managed_extensions||[]).map(x=>x.extension+' ('+x.user_group+')');
       $('gcExtension').textContent=extensions.length?extensions.join(', '):'No administrada por portal';
