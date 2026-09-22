@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Vici-Users Asterisk Sync Worker every 10 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Persistent=true
+Unit=vici-users-asterisk-sync.service
+
+[Install]
+WantedBy=timers.target
