@@ -22,6 +22,9 @@ CREATE_ENABLED = os.getenv("VICI_USERS_ENABLE_CREATE", "false").lower() in {"1",
 WRITE_EXECUTOR_ENABLED = os.getenv(
     "VICI_USERS_WRITE_EXECUTOR_ENABLED", "false"
 ).lower() in {"1", "true", "yes", "y"}
+WRITE_EXECUTOR_LOCAL_ONLY = os.getenv(
+    "VICI_USERS_WRITE_EXECUTOR_LOCAL_ONLY", "true"
+).lower() in {"1", "true", "yes", "y"}
 WRITE_TOKEN_FILE = Path(
     os.getenv(
         "VICI_USERS_WRITE_TOKEN_FILE",
@@ -110,7 +113,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.15.1-provisioning-executor")
+app = FastAPI(title="Vici-Users API", version="0.15.2-local-write-gate")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1110,6 +1113,20 @@ def preview_extension_allocations(user_group, requested):
 
 
 def require_write_execution_gate(request):
+    if WRITE_EXECUTOR_LOCAL_ONLY:
+        host = str(request.url.hostname or "").lower()
+        client_host = str(request.client.host if request.client else "")
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Ejecutor permitido sólo por localhost",
+            )
+        if client_host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Cliente de escritura no local",
+            )
+
     if not CREATE_ENABLED:
         raise HTTPException(
             status_code=403,
@@ -2268,6 +2285,7 @@ def health():
         "db_ok": db_ok,
         "create_enabled": CREATE_ENABLED,
         "write_executor_enabled": WRITE_EXECUTOR_ENABLED,
+        "write_executor_local_only": WRITE_EXECUTOR_LOCAL_ONLY,
         "write_token_configured": WRITE_TOKEN_FILE.exists(),
         "username_max_length": USERNAME_MAX_LENGTH,
         "python_compat": "3.6+",
