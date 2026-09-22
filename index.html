@@ -600,7 +600,26 @@
     const people=peopleFromText(),group=$('userGroup').value;if(!group||!selectedTemplate){toast('Selecciona un User Group que tenga usuario base configurado.');return}if(!people.length){toast('Agrega al menos una persona.');return}
     pendingOperationKey=null;pendingProvisioning=null;
     $('previewBtn').disabled=true;$('previewBtn').textContent='Validando…';
-    try{previewPayload=await api('/users/preview',{method:'POST',body:JSON.stringify({user_group:group,people})});$('passDefaultStatus').textContent=previewPayload.default_password_configured?'Configurado':'No configurado';renderPreview(previewPayload);toast(`Validación completada: ${previewPayload.available} usuario(s) disponibles.`)}catch(error){toast(error.message)}finally{$('previewBtn').disabled=false;$('previewBtn').textContent='Previsualizar y validar'}
+    try{
+      // Refrescar estado de sesión/gates antes del preview.
+      // Esto evita conservar portal_write_enabled=false de una sesión abierta
+      // antes de iniciar cp4-portal-window.sh.
+      const me=await api('/auth/me');
+      showAuthenticated(me);
+
+      previewPayload=await api('/users/preview',{
+        method:'POST',
+        body:JSON.stringify({user_group:group,people})
+      });
+      $('passDefaultStatus').textContent=previewPayload.default_password_configured?'Configurado':'No configurado';
+      renderPreview(previewPayload);
+      toast(`Validación completada: ${previewPayload.available} usuario(s) disponibles.`);
+    }catch(error){
+      toast(error.message);
+    }finally{
+      $('previewBtn').disabled=false;
+      $('previewBtn').textContent='Previsualizar y validar';
+    }
   }
 
   function renderPreview(data){
