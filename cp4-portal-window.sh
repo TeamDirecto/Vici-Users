@@ -105,27 +105,51 @@ set_cfg "VICI_USERS_WRITE_EXECUTOR_ENABLED" "false"
 systemctl restart vici-users
 wait_api || die "Backend no respondió en estado seguro"
 
-log "Validando health y topología 5/5..."
+log "Validando health y topología 4/4 (.94 excluido)..."
+cd "$APP"
 "$PY" - <<'PY'
 import json
+
+from backend.main import load_cluster_nodes
 
 with open("/tmp/vici-users-cp4-health.json") as fh:
     h=json.load(fh)
 
 assert h.get("db_ok") is True, "db_ok != true"
 assert h.get("cluster_topology_ok") is True, "cluster_topology_ok != true"
-assert h.get("provisioning_nodes_count") == 5, "se requieren 5 nodos habilitados"
-assert h.get("disabled_nodes_count") == 0, "deben existir 0 nodos deshabilitados"
+assert h.get("provisioning_nodes_count") == 4, "se requieren 4 nodos habilitados"
+assert h.get("disabled_nodes_count") == 1, "se requiere exactamente 1 nodo deshabilitado"
 assert h.get("operators_configured") is True, "no hay operadores configurados"
 assert h.get("create_enabled") is False, "CREATE debe iniciar false"
 assert h.get("portal_write_enabled") is False, "PORTAL_WRITE debe iniciar false"
 assert h.get("write_executor_enabled") is False, "EXECUTOR local debe iniciar false"
 
-print("[OK] DB y topología 5/5")
+topology = load_cluster_nodes()
+enabled = sorted(
+    str(node["server_ip"])
+    for node in topology["nodes"]
+    if node["enabled"]
+)
+disabled = sorted(
+    str(node["server_ip"])
+    for node in topology["nodes"]
+    if not node["enabled"]
+)
+
+expected_enabled = sorted([
+    "172.20.20.233",
+    "172.20.21.90",
+    "172.20.21.96",
+    "172.20.20.110",
+])
+
+assert enabled == expected_enabled, "topología habilitada inesperada: %s" % enabled
+assert disabled == ["172.20.21.94"], ".94 debe ser el único nodo excluido: %s" % disabled
+
+print("[OK] DB y topología 4/4; 172.20.21.94 excluido")
 PY
 
 log "Validando topología de extensiones administradas por el portal..."
-cd "$APP"
 "$PY" - <<'PY'
 import sqlite3
 
@@ -197,7 +221,7 @@ with db_cursor() as cursor:
             )
 
 if bad:
-    print("[ERROR] Hay extensiones IN_USE del portal que no están sanas 5/5:")
+    print("[ERROR] Hay extensiones IN_USE del portal que no están sanas en los nodos habilitados:")
     for group, extension, user, missing, wrong_group, inactive in bad:
         print("")
         print("  grupo     :", group)
@@ -209,7 +233,7 @@ if bad:
     raise SystemExit(20)
 
 print(
-    "[OK] %d extensión(es) IN_USE administradas por portal sanas 5/5"
+    "[OK] %d extensión(es) IN_USE administradas por portal sanas en 4/4 nodos habilitados"
     % len(managed)
 )
 PY
@@ -229,16 +253,26 @@ wait_api || die "Backend no respondió al abrir CP4"
 "$PY" - <<'PY'
 import json
 
+from backend.main import load_cluster_nodes
+
 with open("/tmp/vici-users-cp4-health.json") as fh:
     h=json.load(fh)
 
 assert h.get("create_enabled") is True
 assert h.get("portal_write_enabled") is True
 assert h.get("write_executor_enabled") is False
-assert h.get("provisioning_nodes_count") == 5
-assert h.get("disabled_nodes_count") == 0
+assert h.get("provisioning_nodes_count") == 4
+assert h.get("disabled_nodes_count") == 1
 
-print("[OK] CREATE=true / PORTAL_WRITE=true / EXECUTOR_LOCAL=false / NODOS=5")
+topology = load_cluster_nodes()
+disabled = sorted(
+    str(node["server_ip"])
+    for node in topology["nodes"]
+    if not node["enabled"]
+)
+assert disabled == ["172.20.21.94"]
+
+print("[OK] CREATE=true / PORTAL_WRITE=true / EXECUTOR_LOCAL=false / NODOS=4 / .94=EXCLUIDO")
 PY
 
 echo
@@ -247,6 +281,7 @@ echo " CP4 ABIERTO"
 echo "============================================================"
 echo " Portal : https://teamdirecto.github.io/Vici-Users/"
 echo " Tiempo : ${WINDOW_SECONDS} segundos"
+echo " Nodos  : 4 operativos; 172.20.21.94 excluido temporalmente"
 echo " Regla  : una sola alta / extensión UNCREATED / admin"
 echo " Cierre : automático al primer resultado o por timeout"
 echo "============================================================"
