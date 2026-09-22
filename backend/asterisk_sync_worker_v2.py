@@ -144,6 +144,54 @@ def process_wait_settle(sqlite_db, mysql_cursor, job):
     )
 
 
+def discover_group_change_jobs(connection):
+    """Queue one rebuild/reload cycle for each completed group migration."""
+    table = connection.execute(
+        """
+        SELECT name
+          FROM sqlite_master
+         WHERE type='table'
+           AND name='group_change_operations'
+        """
+    ).fetchone()
+    if not table:
+        return 0
+
+    enabled = base.load_enabled_servers()
+    required_json = json.dumps(enabled, sort_keys=True)
+    rows = connection.execute(
+        """
+        SELECT g.idempotency_key, g.target_extension, g.username
+          FROM group_change_operations g
+          LEFT JOIN asterisk_sync_jobs j
+            ON j.idempotency_key=('GC:' || g.idempotency_key)
+         WHERE g.status='SUCCESS'
+           AND j.idempotency_key IS NULL
+         ORDER BY g.updated_at, g.idempotency_key
+        """
+    ).fetchall()
+
+    for item in rows:
+        connection.execute(
+            """
+            INSERT INTO asterisk_sync_jobs
+                (idempotency_key, extension, username,
+                 required_servers_json, eligible_servers_json,
+                 ineligible_servers_json, status, updated_at)
+            VALUES (?, ?, ?, ?, '[]', '[]', 'NEW', ?)
+            """,
+            (
+                "GC:" + str(item["idempotency_key"]),
+                str(item["target_extension"]),
+                str(item["username"] or ""),
+                required_json,
+                base.now_text(),
+            ),
+        )
+    connection.commit()
+    return len(rows)
+
+
 def run_once(bootstrap_only=False):
     if not base.INVENTORY_DB_FILE.exists():
         raise RuntimeError("INVENTORY_DB_NOT_FOUND:%s" % base.INVENTORY_DB_FILE)
@@ -159,9 +207,18 @@ def run_once(bootstrap_only=False):
             print("ASTERISK_SYNC disabled; no MySQL writes performed")
             return 0
 
-        discovered = base.discover_new_jobs(sqlite_db)
+        discovered_provisioning = base.discover_new_jobs(sqlite_db)
+        discovered_group_changes = discover_group_change_jobs(sqlite_db)
+        discovered = discovered_provisioning + discovered_group_changes
         if discovered:
-            print("DISCOVERED new_sync_jobs=%d" % discovered)
+            print(
+                "DISCOVERED new_sync_jobs=%d provisioning=%d group_change=%d"
+                % (
+                    discovered,
+                    discovered_provisioning,
+                    discovered_group_changes,
+                )
+            )
 
         cfg = base.read_astguiclient_conf()
         mysql_db = pymysql.connect(**cfg)
