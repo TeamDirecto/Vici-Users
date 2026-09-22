@@ -27,8 +27,9 @@ with open('/tmp/vici-users-health-public.json') as fh:
 assert h.get('db_ok') is True, 'db_ok no es true'
 assert h.get('db_node') == 'vici222', 'DB no es vici222'
 assert h.get('db_name') == 'asterisk', 'DB no es asterisk'
-assert h.get('create_enabled') is False, 'CREATE debe seguir false en CP1'
-print('Backend OK: vici97 -> vici222/asterisk, CREATE=false')
+assert h.get('create_enabled') is False, 'CREATE debe seguir false'
+assert h.get('write_executor_enabled') is False, 'WRITE EXECUTOR debe seguir false'
+print('Backend OK: vici97 -> vici222/asterisk, CREATE=false, EXECUTOR=false')
 PY
 
 log "Validando módulos Apache"
@@ -103,5 +104,6 @@ cat <<EOF
  API local      : ${LOCAL_API}
  DB             : vici222 / asterisk
  CREATE         : false
+ WRITE EXECUTOR  : false
 ============================================================
 EOF
