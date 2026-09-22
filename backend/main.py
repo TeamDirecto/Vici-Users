@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.17.0-portal-confirmation")
+app = FastAPI(title="Vici-Users API", version="0.17.1-ephemeral-credentials")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1893,9 +1893,10 @@ def compensate_provisioning(payload, inserted_phones, user_inserted):
     return errors
 
 
-def execute_provisioning(payload):
+def execute_provisioning(payload, expose_credentials=False):
     replay = replay_provisioning_operation_if_known(payload)
     if replay is not None:
+        replay["credentials_available"] = False
         return replay
 
     plan = provisioning_write_plan(
@@ -1923,7 +1924,9 @@ def execute_provisioning(payload):
 
     reservation = reserve_provisioning_operation(payload)
     if reservation.get("replay"):
-        return reservation["result"]
+        replay_result = reservation["result"]
+        replay_result["credentials_available"] = False
+        return replay_result
 
     # Revalidar después de reservar para cerrar la ventana preview -> ejecución.
     recheck = provisioning_write_plan(
@@ -2098,7 +2101,21 @@ def execute_provisioning(payload):
             "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
         }
 
+        # Persistir únicamente el resultado no sensible.
+        # La contraseña nunca entra a result_json, SQLite ni auth_audit.
         finalize_inventory_in_use(payload, result)
+
+        if expose_credentials:
+            response_result = dict(result)
+            response_result["credentials_available"] = True
+            response_result["credentials"] = {
+                "username": payload.username.upper(),
+                "password": agent_password,
+                "phone": payload.extension,
+            }
+            return response_result
+
+        result["credentials_available"] = False
         return result
 
     except HTTPException:
@@ -3131,7 +3148,7 @@ def portal_provisioning_execute_route(
     )
 
     try:
-        result = execute_provisioning(payload)
+        result = execute_provisioning(payload, expose_credentials=True)
     except HTTPException as exc:
         event_type = (
             "PROVISIONING_FAILED"
