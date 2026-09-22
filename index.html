@@ -11,6 +11,7 @@
     .operator-box{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}.operator-chip{display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 10px;font-size:12px}.operator-chip strong{font-size:12px}.operator-chip span{color:var(--muted)}.logout-btn{border:1px solid var(--line);background:#fff;color:#334155;border-radius:9px;padding:7px 10px;font-size:11px;font-weight:800;cursor:pointer}
     .auth-overlay{position:fixed;inset:0;background:rgba(15,23,42,.76);backdrop-filter:blur(7px);display:grid;place-items:center;padding:22px;z-index:100}.auth-card{width:min(430px,100%);background:#fff;border-radius:20px;box-shadow:0 28px 80px rgba(0,0,0,.32);overflow:hidden}.auth-head{padding:24px 26px 18px;border-bottom:1px solid var(--line)}.auth-brand{display:flex;align-items:center;gap:12px}.auth-head h2{margin:0;font-size:21px}.auth-head p{margin:8px 0 0;color:var(--muted);font-size:12px;line-height:1.5}.auth-body{padding:22px 26px 26px}.auth-body .btn{width:100%}.auth-error{margin:0 0 14px;padding:10px 12px;border-radius:10px;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;font-size:12px}.auth-meta{margin-top:14px;text-align:center;font-size:11px;color:var(--muted)}
     .confirm-overlay{position:fixed;inset:0;background:rgba(15,23,42,.70);backdrop-filter:blur(5px);display:grid;place-items:center;padding:22px;z-index:90}.confirm-card{width:min(520px,100%);background:#fff;border-radius:18px;box-shadow:0 28px 80px rgba(0,0,0,.28);overflow:hidden}.confirm-head{padding:20px 22px;border-bottom:1px solid var(--line)}.confirm-head h2{margin:0;font-size:18px}.confirm-head p{margin:6px 0 0;color:var(--muted);font-size:12px}.confirm-body{padding:20px 22px}.confirm-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}.confirm-item{border:1px solid var(--line);background:#f8fafc;border-radius:11px;padding:10px}.confirm-item span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em}.confirm-item strong{display:block;margin-top:3px;font-size:12px;word-break:break-word}.confirm-warning{border:1px solid #fed7aa;background:#fff7ed;color:#9a3412;border-radius:11px;padding:11px 12px;font-size:11px;line-height:1.5;margin-bottom:14px}.confirm-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:15px}.confirm-actions .btn{min-width:110px}
+    .receipt-overlay{position:fixed;inset:0;background:rgba(15,23,42,.72);backdrop-filter:blur(6px);display:grid;place-items:center;padding:22px;z-index:95}.receipt-card{width:min(560px,100%);background:#fff;border-radius:20px;box-shadow:0 30px 90px rgba(0,0,0,.32);overflow:hidden}.receipt-head{padding:22px 24px;border-bottom:1px solid var(--line);background:#f0fdf4}.receipt-head h2{margin:0;color:var(--green);font-size:20px}.receipt-head p{margin:6px 0 0;color:#475569;font-size:12px}.receipt-body{padding:22px 24px}.credential-grid{display:grid;grid-template-columns:1fr;gap:10px}.credential-row{display:grid;grid-template-columns:120px minmax(0,1fr) auto;gap:10px;align-items:center;border:1px solid var(--line);background:#f8fafc;border-radius:11px;padding:11px 12px}.credential-row span{font-size:10px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}.credential-row strong{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;word-break:break-all}.mini-btn{border:1px solid var(--line);background:#fff;color:#334155;border-radius:8px;padding:6px 9px;font-size:10px;font-weight:800;cursor:pointer}.receipt-note{margin-top:14px;border:1px solid #bfdbfe;background:#eff6ff;color:#475569;border-radius:11px;padding:11px 12px;font-size:11px;line-height:1.5}.receipt-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:16px}
     @media(max-width:1050px){.layout{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:720px){.shell{grid-template-columns:1fr}.sidebar{display:none}.main{padding:18px}.top{flex-direction:column}.stats{grid-template-columns:1fr 1fr}.footer{align-items:stretch;flex-direction:column}}
   </style>
 </head>
@@ -103,6 +104,41 @@
     </div>
   </main>
 </div>
+<div id="receiptOverlay" class="receipt-overlay hidden">
+  <div class="receipt-card">
+    <div class="receipt-head">
+      <h2>✓ Alta completada</h2>
+      <p>Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.</p>
+    </div>
+    <div class="receipt-body">
+      <div class="credential-grid">
+        <div class="credential-row">
+          <span>Usuario</span>
+          <strong id="receiptUsername">—</strong>
+          <button id="copyUserBtn" class="mini-btn" type="button">Copiar</button>
+        </div>
+        <div class="credential-row">
+          <span>Contraseña</span>
+          <strong id="receiptPassword">••••••••</strong>
+          <button id="toggleReceiptPassBtn" class="mini-btn" type="button">Mostrar</button>
+        </div>
+        <div class="credential-row">
+          <span>Phone</span>
+          <strong id="receiptPhone">—</strong>
+          <button id="copyPhoneBtn" class="mini-btn" type="button">Copiar</button>
+        </div>
+      </div>
+      <div class="receipt-note">
+        La contraseña no se guarda en el navegador, journal ni auditoría. Al cerrar este comprobante o recargar la página dejará de estar disponible.
+      </div>
+      <div class="receipt-actions">
+        <button id="copyCredentialsBtn" class="btn secondary" type="button">Copiar Usuario | Contraseña | Phone</button>
+        <button id="closeReceiptBtn" class="btn success" type="button">Cerrar</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="confirmOverlay" class="confirm-overlay hidden">
   <div class="confirm-card">
     <div class="confirm-head">
@@ -173,6 +209,8 @@
   let authUser = null;
   let pendingOperationKey = null;
   let pendingProvisioning = null;
+  let receiptCredentials = null;
+  let receiptPasswordVisible = false;
   const AUTH_STORAGE_KEY = 'viciUsersAuthToken';
 
   const $ = id => document.getElementById(id);
@@ -269,6 +307,7 @@
     previewPayload=null;
     pendingOperationKey=null;
     pendingProvisioning=null;
+    clearCredentialReceipt();
     $('userGroup').innerHTML='<option value="">Inicia sesión para continuar</option>';
     $('userGroup').disabled=true;
     $('previewBtn').disabled=true;
@@ -389,6 +428,8 @@
       $('createNote').textContent='SUCCESS: '+result.username+' + '+result.extension+' · '+result.required_nodes+' nodo(s) · operador '+(result.requested_by||authUser.username)+'.';
       toast('Alta completada: '+result.username+' / '+result.extension+'.');
 
+      showCredentialReceipt(result);
+
       previewPayload=null;
       pendingOperationKey=null;
       pendingProvisioning=null;
@@ -404,6 +445,77 @@
       $('confirmCreateBtn').textContent='Crear ahora';
       $('confirmCreateBtn').disabled=$('confirmPhrase').value.trim()!=='CREAR';
     }
+  }
+
+  function renderReceiptPassword(){
+    if(!receiptCredentials||!receiptCredentials.password){
+      $('receiptPassword').textContent='No disponible';
+      $('toggleReceiptPassBtn').disabled=true;
+      return;
+    }
+    $('toggleReceiptPassBtn').disabled=false;
+    $('receiptPassword').textContent=receiptPasswordVisible
+      ? receiptCredentials.password
+      : '••••••••';
+    $('toggleReceiptPassBtn').textContent=receiptPasswordVisible?'Ocultar':'Mostrar';
+  }
+
+  function showCredentialReceipt(result){
+    const credentials=result&&result.credentials_available&&result.credentials
+      ? result.credentials
+      : null;
+
+    receiptCredentials=credentials?{
+      username:String(credentials.username||result.username||''),
+      password:String(credentials.password||''),
+      phone:String(credentials.phone||result.extension||'')
+    }:{
+      username:String((result&&result.username)||''),
+      password:'',
+      phone:String((result&&result.extension)||'')
+    };
+
+    receiptPasswordVisible=false;
+    $('receiptUsername').textContent=receiptCredentials.username||'—';
+    $('receiptPhone').textContent=receiptCredentials.phone||'—';
+    renderReceiptPassword();
+    $('receiptOverlay').classList.remove('hidden');
+  }
+
+  function clearCredentialReceipt(){
+    receiptCredentials=null;
+    receiptPasswordVisible=false;
+    $('receiptUsername').textContent='—';
+    $('receiptPassword').textContent='••••••••';
+    $('receiptPhone').textContent='—';
+    $('receiptOverlay').classList.add('hidden');
+  }
+
+  async function copyText(value,label){
+    if(!value){toast(label+' no disponible.');return}
+    try{
+      await navigator.clipboard.writeText(value);
+      toast(label+' copiado.');
+    }catch(error){
+      toast('No fue posible copiar automáticamente.');
+    }
+  }
+
+  function toggleReceiptPassword(){
+    if(!receiptCredentials||!receiptCredentials.password)return;
+    receiptPasswordVisible=!receiptPasswordVisible;
+    renderReceiptPassword();
+  }
+
+  function copyReceiptCredentials(){
+    if(!receiptCredentials||!receiptCredentials.password){
+      toast('La contraseña ya no está disponible.');
+      return;
+    }
+    copyText(
+      receiptCredentials.username+' | '+receiptCredentials.password+' | '+receiptCredentials.phone,
+      'Credenciales'
+    );
   }
 
   function setConnection(ok,text){$('serverDot').className='dot '+(ok?'ok':'bad');$('topDot').className='dot '+(ok?'ok':'bad');$('connectionText').textContent=text;$('serverText').textContent=ok?'API vici97 activa y vici222 accesible.':'Sin conexión con backend o DB central.'}
@@ -509,6 +621,11 @@
   }
 
   $('loginForm').addEventListener('submit',login);$('logoutBtn').addEventListener('click',logout);
+  $('toggleReceiptPassBtn').addEventListener('click',toggleReceiptPassword);
+  $('copyUserBtn').addEventListener('click',()=>copyText(receiptCredentials&&receiptCredentials.username,'Usuario'));
+  $('copyPhoneBtn').addEventListener('click',()=>copyText(receiptCredentials&&receiptCredentials.phone,'Phone'));
+  $('copyCredentialsBtn').addEventListener('click',copyReceiptCredentials);
+  $('closeReceiptBtn').addEventListener('click',clearCredentialReceipt);
   $('confirmPhrase').addEventListener('input',()=>{$('confirmCreateBtn').disabled=$('confirmPhrase').value.trim()!=='CREAR'});
   $('cancelCreateBtn').addEventListener('click',closeCreateConfirmation);
   $('confirmCreateBtn').addEventListener('click',executePortalProvisioning);
