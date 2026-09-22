@@ -124,30 +124,94 @@ assert h.get("write_executor_enabled") is False, "EXECUTOR local debe iniciar fa
 print("[OK] DB y topología 5/5")
 PY
 
-log "Validando que no existan extensiones incompletas/desalineadas..."
+log "Validando topología de extensiones administradas por el portal..."
 cd "$APP"
 "$PY" - <<'PY'
-from backend.main import load_extension_ranges, extension_inventory_snapshot
+import sqlite3
+
+from backend.main import db_cursor, load_cluster_nodes
+
+DB = "/var/lib/vici-users/extension_inventory.db"
+topology = load_cluster_nodes()
+enabled = set(
+    node["server_ip"]
+    for node in topology["nodes"]
+    if node["enabled"]
+)
+
+local = sqlite3.connect(DB)
+local.row_factory = sqlite3.Row
+try:
+    managed = local.execute(
+        """
+        SELECT extension, user_group, current_user, status
+          FROM extension_inventory
+         WHERE status='IN_USE'
+         ORDER BY user_group, extension
+        """
+    ).fetchall()
+finally:
+    local.close()
 
 bad = []
-for group in sorted(load_extension_ranges()):
-    snap = extension_inventory_snapshot(group)
-    summary = snap.get("summary") or {}
-    incomplete = int(summary.get("topology_incomplete") or 0)
-    mismatches = int(summary.get("group_mismatches") or 0)
-    if incomplete or mismatches:
-        bad.append((group, incomplete, mismatches))
+
+with db_cursor() as cursor:
+    for item in managed:
+        extension = str(item["extension"])
+        group = str(item["user_group"])
+
+        cursor.execute(
+            """
+            SELECT extension, server_ip, user_group, active
+              FROM phones
+             WHERE extension=%s
+             ORDER BY server_ip
+            """,
+            (extension,),
+        )
+        rows = cursor.fetchall()
+
+        by_server = {}
+        for row in rows:
+            server = str(row.get("server_ip") or "")
+            if server:
+                by_server[server] = row
+
+        missing = sorted(enabled.difference(set(by_server)))
+        wrong_group = sorted(
+            server
+            for server, row in by_server.items()
+            if server in enabled
+            and str(row.get("user_group") or "") != group
+        )
+        inactive = sorted(
+            server
+            for server, row in by_server.items()
+            if server in enabled
+            and str(row.get("active") or "").upper() != "Y"
+        )
+
+        if missing or wrong_group or inactive:
+            bad.append(
+                (group, extension, item["current_user"], missing, wrong_group, inactive)
+            )
 
 if bad:
-    print("[ERROR] El cluster 5/5 todavía requiere reconciliación:")
-    for group, incomplete, mismatches in bad:
-        print(
-            "  %s: incompletas=%d desalineadas=%d"
-            % (group, incomplete, mismatches)
-        )
+    print("[ERROR] Hay extensiones IN_USE del portal que no están sanas 5/5:")
+    for group, extension, user, missing, wrong_group, inactive in bad:
+        print("")
+        print("  grupo     :", group)
+        print("  extension :", extension)
+        print("  usuario   :", user)
+        print("  faltantes :", ",".join(missing) or "-")
+        print("  otro grupo:", ",".join(wrong_group) or "-")
+        print("  inactivos :", ",".join(inactive) or "-")
     raise SystemExit(20)
 
-print("[OK] Auditoría de topología limpia")
+print(
+    "[OK] %d extensión(es) IN_USE administradas por portal sanas 5/5"
+    % len(managed)
+)
 PY
 
 BASELINE_ID="$(
