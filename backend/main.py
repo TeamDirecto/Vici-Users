@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.18.1-group-change-password-preview")
+app = FastAPI(title="Vici-Users API", version="0.18.2-group-change-extension-preview")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1221,7 +1221,7 @@ def extension_candidate_pool(user_group):
     return free_candidates + uncreated_candidates
 
 
-def preview_extension_allocations(user_group, requested):
+def preview_extension_allocations(user_group, requested, allow_free=True):
     requested = int(requested)
     if requested <= 0:
         return {
@@ -1233,6 +1233,9 @@ def preview_extension_allocations(user_group, requested):
         }
 
     candidates = extension_candidate_pool(user_group)
+    if not allow_free:
+        candidates = [row for row in candidates if row.get("source") == "UNCREATED"]
+
     topology = load_cluster_nodes()
     enabled_nodes = [node for node in topology["nodes"] if node["enabled"]]
     extension_range = require_provisioning_group(user_group)
@@ -2935,6 +2938,16 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
         if current.get(field) != target_template.get(field):
             changed_permission_fields.append(field)
 
+    target_extension_preview = preview_extension_allocations(
+        target_group,
+        1,
+        allow_free=False,
+    )
+    target_allocations = target_extension_preview.get("allocations") or []
+    target_extension_allocation = (
+        target_allocations[0] if target_allocations else None
+    )
+
     managed_extensions = []
     ensure_inventory_db()
     connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
@@ -2956,6 +2969,13 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
 
     blockers = []
     warnings = []
+
+    target_password_configured = target_group in load_group_defaults()
+    if not target_password_configured:
+        blockers.append("TARGET_DEFAULT_PASSWORD_NOT_CONFIGURED")
+
+    if not target_extension_allocation:
+        blockers.append("NO_TARGET_UNCREATED_EXTENSION_AVAILABLE")
 
     if current_group == target_group:
         blockers.append("SAME_GROUP")
@@ -2998,8 +3018,16 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
         ],
         "password_change": {
             "action": "REPLACE_WITH_TARGET_GROUP_DEFAULT",
-            "target_default_configured": target_group in load_group_defaults(),
+            "target_default_configured": target_password_configured,
             "password_exposed": False,
+        },
+        "target_extension_allocation": target_extension_allocation,
+        "target_extension_policy": {
+            "reuse_free": False,
+            "selection": "FIRST_READY_UNCREATED_IN_CONFIGURED_RANGE",
+            "range": require_provisioning_group(target_group),
+            "required_nodes": target_extension_preview.get("required_nodes", 0),
+            "templates_ready": target_extension_preview.get("templates_ready", False),
         },
         "permission_fields_total": len(USER_CLONE_FIELDS),
         "permission_fields_changed": len(changed_permission_fields),
