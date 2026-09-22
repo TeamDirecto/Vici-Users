@@ -100,7 +100,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.14.1-phone-fullname-mapping")
+app = FastAPI(title="Vici-Users API", version="0.14.2-phone-runtime-reset")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -588,12 +588,22 @@ def provisioning_write_plan(user_group, username, full_name, extension):
             "extension",
             "dialplan_number",
             "voicemail_id",
+            "phone_ip",
+            "computer_ip",
             "server_ip",
             "login",
             "pass",
+            "status",
             "active",
-            "user_group",
             "fullname",
+            "messages",
+            "old_messages",
+            "login_user",
+            "login_pass",
+            "login_campaign",
+            "user_group",
+            "peer_status",
+            "ping_time",
         }
 
         source_by_server = dict(
@@ -657,12 +667,22 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                 "extension": extension_text,
                 "dialplan_number": target["dialplan_number"],
                 "voicemail_id": extension_text,
+                "phone_ip": None,
+                "computer_ip": None,
                 "server_ip": server_ip,
                 "login": target["login"],
                 "pass": extension_text,
+                "status": "ACTIVE",
                 "active": "N",
-                "user_group": user_group,
                 "fullname": target_fullname,
+                "messages": 0,
+                "old_messages": 0,
+                "login_user": None,
+                "login_pass": None,
+                "login_campaign": None,
+                "user_group": user_group,
+                "peer_status": "UNKNOWN",
+                "ping_time": None,
             }
 
             select_parts = []
@@ -704,12 +724,22 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                     {"field": "extension", "from": source_extension_text, "to": extension_text},
                     {"field": "dialplan_number", "from": str(source_row.get("dialplan_number") or ""), "to": target["dialplan_number"]},
                     {"field": "voicemail_id", "from": str(source_row.get("voicemail_id") or ""), "to": extension_text},
+                    {"field": "phone_ip", "from": "<SOURCE_VALUE>", "to": None},
+                    {"field": "computer_ip", "from": "<SOURCE_VALUE>", "to": None},
                     {"field": "server_ip", "from": str(source_row.get("server_ip") or ""), "to": server_ip},
                     {"field": "login", "from": str(source_row.get("login") or ""), "to": target["login"]},
                     {"field": "pass", "from": "<SOURCE_PHONE_PASS>", "to": "<TARGET_EXTENSION>"},
+                    {"field": "status", "from": str(source_row.get("status") or ""), "to": "ACTIVE"},
                     {"field": "active", "from": str(source_row.get("active") or ""), "to": "N"},
-                    {"field": "user_group", "from": str(source_row.get("user_group") or ""), "to": user_group},
                     {"field": "fullname", "from": source_fullname, "to": target_fullname},
+                    {"field": "messages", "from": "<SOURCE_VALUE>", "to": 0},
+                    {"field": "old_messages", "from": "<SOURCE_VALUE>", "to": 0},
+                    {"field": "login_user", "from": "<SOURCE_VALUE>", "to": None},
+                    {"field": "login_pass", "from": "<SOURCE_VALUE>", "to": None},
+                    {"field": "login_campaign", "from": "<SOURCE_VALUE>", "to": None},
+                    {"field": "user_group", "from": str(source_row.get("user_group") or ""), "to": user_group},
+                    {"field": "peer_status", "from": "<SOURCE_VALUE>", "to": "UNKNOWN"},
+                    {"field": "ping_time", "from": "<SOURCE_VALUE>", "to": None},
                 ],
                 "copied_fields_count": len(phone_columns) - len(phone_override_fields),
                 "conf_secret_strategy": "COPY_FROM_NODE_TEMPLATE",
