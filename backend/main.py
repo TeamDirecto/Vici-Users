@@ -3767,7 +3767,6 @@ def execute_group_change(payload, preview):
         )
 
     reserve_group_change_operation(payload, preview)
-    set_group_change_operation_status(payload.idempotency_key, "RUNNING")
 
     inserted_phones = []
     target_alias_created = False
@@ -3781,6 +3780,7 @@ def execute_group_change(payload, preview):
     connection = None
 
     try:
+        set_group_change_operation_status(payload.idempotency_key, "RUNNING")
         cfg = db_config()
         cfg["autocommit"] = True
         connection = pymysql.connect(**cfg)
