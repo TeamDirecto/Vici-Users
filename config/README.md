@@ -95,15 +95,13 @@ dialers ni el detalle completo de posiciones.
 extensión. Un nodo con `enabled=false` sigue perteneciendo al cluster, pero no
 es obligatorio para considerar completa una provisión nueva.
 
-Actualmente EHECTO trabaja con 4 nodos obligatorios y 1 nodo temporalmente
-excluido por problemas de registro. Las filas ya existentes en un nodo
-deshabilitado siguen siendo visibles al inventario y nunca hacen que una
-extensión pase a `UNCREATED`.
+EHECTO vuelve a trabajar con los **5 nodos obligatorios**. El nodo
+`172.20.21.94` fue rehabilitado en `cluster_nodes.json`, por lo que toda
+provisión nueva debe validar topología **5/5**.
 
-Cuando el nodo excluido vuelva a estar operativo, basta con cambiar su bandera a
-`enabled=true`; a partir de ese momento la validación de topología exigirá de
-nuevo 5/5 nodos. Antes de habilitarlo para nuevas altas debe ejecutarse un fix
-para completar las extensiones que hayan sido creadas durante el periodo 4/4.
+Las extensiones creadas durante el periodo temporal 4/4 deben reconciliarse
+antes de abrir escritura desde el portal. El inventario las marcará como
+`topology_incomplete` hasta que exista su phone canónico en el quinto nodo.
 
 
 ## Regla canónica de identidad para nuevas extensiones
@@ -386,3 +384,33 @@ PROVISIONING_FAILED
 ```
 
 sin registrar passwords ni secretos del phone.
+
+
+### Ventana controlada CP4
+
+`cp4-portal-window.sh` abre temporalmente una única ventana de escritura web.
+Antes de habilitarla exige:
+
+```text
+DB OK
+5 nodos habilitados
+0 nodos deshabilitados
+operadores configurados
+CREATE=false al inicio
+PORTAL_WRITE=false al inicio
+EXECUTOR local=false
+0 extensiones topology_incomplete
+0 desalineaciones de grupo
+```
+
+Durante la ventana mantiene el ejecutor local apagado y sólo habilita:
+
+```text
+VICI_USERS_ENABLE_CREATE=true
+VICI_USERS_PORTAL_WRITE_ENABLED=true
+VICI_USERS_WRITE_EXECUTOR_ENABLED=false
+```
+
+Se cierra automáticamente después del primer evento terminal de provisión
+(`SUCCESS`, `BLOCKED` o `FAILED`) o por timeout. El trap de salida vuelve
+a dejar todos los flags de escritura en `false`.
