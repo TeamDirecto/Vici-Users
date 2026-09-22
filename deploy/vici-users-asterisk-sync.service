@@ -9,7 +9,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/vici-users
 EnvironmentFile=-/etc/sysconfig/vici-users
-ExecStart=/opt/vici-users/.venv/bin/python /opt/vici-users/backend/asterisk_sync_worker.py
+ExecStart=/opt/vici-users/.venv/bin/python /opt/vici-users/backend/asterisk_sync_worker_v2.py
 Nice=5
 
 [Install]
