@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import unicodedata
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import pymysql
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -18,6 +19,15 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 ASTGUI_CONF = Path(os.getenv("ASTGUI_CONF", "/etc/astguiclient.conf"))
 EXPECTED_DB_HOST = os.getenv("VICI_DB_EXPECTED_HOST", "172.20.20.198")
 CREATE_ENABLED = os.getenv("VICI_USERS_ENABLE_CREATE", "false").lower() in {"1", "true", "yes", "y"}
+WRITE_EXECUTOR_ENABLED = os.getenv(
+    "VICI_USERS_WRITE_EXECUTOR_ENABLED", "false"
+).lower() in {"1", "true", "yes", "y"}
+WRITE_TOKEN_FILE = Path(
+    os.getenv(
+        "VICI_USERS_WRITE_TOKEN_FILE",
+        "/etc/vici-users/write_token",
+    )
+)
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
 GROUP_TEMPLATES_FILE = Path(
     os.getenv("VICI_USERS_GROUP_TEMPLATES_FILE", "/etc/vici-users/group_templates.json")
@@ -100,7 +110,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.14.2-phone-runtime-reset")
+app = FastAPI(title="Vici-Users API", version="0.15.0-provisioning-executor")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1099,6 +1109,679 @@ def preview_extension_allocations(user_group, requested):
     }
 
 
+def require_write_execution_gate(request):
+    if not CREATE_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="Creación deshabilitada por VICI_USERS_ENABLE_CREATE",
+        )
+    if not WRITE_EXECUTOR_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="Ejecutor de escritura deshabilitado",
+        )
+    if not WRITE_TOKEN_FILE.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="Token local de escritura no configurado",
+        )
+
+    try:
+        expected = WRITE_TOKEN_FILE.read_text().strip()
+    except OSError:
+        raise HTTPException(
+            status_code=503,
+            detail="No fue posible leer el token local de escritura",
+        )
+
+    supplied = str(request.headers.get("X-Vici-Users-Write-Token") or "")
+    if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+        raise HTTPException(status_code=403, detail="Token de escritura inválido")
+
+
+def reserve_provisioning_operation(payload):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        existing = connection.execute(
+            """
+            SELECT idempotency_key, user_group, username, full_name, extension,
+                   status, result_json
+              FROM provisioning_operations
+             WHERE idempotency_key=?
+            """,
+            (payload.idempotency_key,),
+        ).fetchone()
+
+        if existing:
+            same_payload = (
+                str(existing["user_group"]) == payload.user_group
+                and str(existing["username"]) == payload.username.upper()
+                and str(existing["full_name"]) == payload.full_name
+                and str(existing["extension"]) == payload.extension
+            )
+            if not same_payload:
+                connection.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",
+                )
+
+            if existing["status"] == "SUCCESS" and existing["result_json"]:
+                result = json.loads(existing["result_json"])
+                connection.commit()
+                return {"replay": True, "result": result}
+
+            status = str(existing["status"])
+            connection.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="IDEMPOTENCY_KEY_ALREADY_USED:%s" % status,
+            )
+
+        inventory = connection.execute(
+            """
+            SELECT extension, user_group, status, current_user
+              FROM extension_inventory
+             WHERE extension=?
+            """,
+            (payload.extension,),
+        ).fetchone()
+
+        if inventory:
+            connection.rollback()
+            if str(inventory["status"]).upper() == "FREE":
+                raise HTTPException(
+                    status_code=409,
+                    detail="FREE_REUSE_NOT_IMPLEMENTED_IN_EXECUTOR_V1",
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="EXTENSION_ALREADY_RESERVED_OR_MANAGED:%s"
+                % str(inventory["status"]),
+            )
+
+        connection.execute(
+            """
+            INSERT INTO provisioning_operations
+                (idempotency_key, user_group, username, full_name,
+                 extension, status)
+            VALUES (?, ?, ?, ?, ?, 'RESERVED')
+            """,
+            (
+                payload.idempotency_key,
+                payload.user_group,
+                payload.username.upper(),
+                payload.full_name,
+                payload.extension,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO extension_inventory
+                (extension, user_group, status, current_user,
+                 reserved_at, updated_at, note)
+            VALUES (?, ?, 'RESERVED', ?, CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP, ?)
+            """,
+            (
+                payload.extension,
+                payload.user_group,
+                payload.username.upper(),
+                "Provisioning %s" % payload.idempotency_key,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO extension_inventory_events
+                (extension, user_group, event_type, old_status,
+                 new_status, user_name, detail)
+            VALUES (?, ?, 'RESERVE', 'UNCREATED', 'RESERVED', ?, ?)
+            """,
+            (
+                payload.extension,
+                payload.user_group,
+                payload.username.upper(),
+                "idempotency_key=%s" % payload.idempotency_key,
+            ),
+        )
+        connection.commit()
+        return {"replay": False}
+    except HTTPException:
+        raise
+    except sqlite3.Error as exc:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="No fue posible reservar la operación: %s" % exc,
+        )
+    finally:
+        connection.close()
+
+
+def set_provisioning_operation_status(
+    idempotency_key,
+    status,
+    result=None,
+    error_text=None,
+):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute(
+            """
+            UPDATE provisioning_operations
+               SET status=?,
+                   result_json=?,
+                   error_text=?,
+                   updated_at=CURRENT_TIMESTAMP
+             WHERE idempotency_key=?
+            """,
+            (
+                status,
+                json.dumps(result, sort_keys=True) if result is not None else None,
+                error_text,
+                idempotency_key,
+            ),
+        )
+        connection.commit()
+    except sqlite3.Error as exc:
+        raise RuntimeError("SQLite operation status update failed: %s" % exc)
+    finally:
+        connection.close()
+
+
+def finalize_inventory_in_use(payload, result):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            """
+            UPDATE extension_inventory
+               SET status='IN_USE',
+                   current_user=?,
+                   assigned_at=CURRENT_TIMESTAMP,
+                   updated_at=CURRENT_TIMESTAMP,
+                   note=?
+             WHERE extension=?
+               AND user_group=?
+               AND status='RESERVED'
+               AND current_user=?
+            """,
+            (
+                payload.username.upper(),
+                "Provisioning SUCCESS %s" % payload.idempotency_key,
+                payload.extension,
+                payload.user_group,
+                payload.username.upper(),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("La reserva local ya no está en estado RESERVED")
+
+        connection.execute(
+            """
+            INSERT INTO extension_inventory_events
+                (extension, user_group, event_type, old_status,
+                 new_status, user_name, detail)
+            VALUES (?, ?, 'ASSIGN', 'RESERVED', 'IN_USE', ?, ?)
+            """,
+            (
+                payload.extension,
+                payload.user_group,
+                payload.username.upper(),
+                "idempotency_key=%s" % payload.idempotency_key,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE provisioning_operations
+               SET status='SUCCESS',
+                   result_json=?,
+                   error_text=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+             WHERE idempotency_key=?
+            """,
+            (
+                json.dumps(result, sort_keys=True),
+                payload.idempotency_key,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def release_inventory_after_compensation(payload, error_text, compensation_ok):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if compensation_ok:
+            connection.execute(
+                """
+                DELETE FROM extension_inventory
+                 WHERE extension=?
+                   AND user_group=?
+                   AND status='RESERVED'
+                   AND current_user=?
+                """,
+                (
+                    payload.extension,
+                    payload.user_group,
+                    payload.username.upper(),
+                ),
+            )
+            new_status = "UNCREATED"
+            operation_status = "COMPENSATED"
+        else:
+            connection.execute(
+                """
+                UPDATE extension_inventory
+                   SET status='ERROR',
+                       updated_at=CURRENT_TIMESTAMP,
+                       note=?
+                 WHERE extension=?
+                   AND user_group=?
+                """,
+                (
+                    "Compensation failed for %s" % payload.idempotency_key,
+                    payload.extension,
+                    payload.user_group,
+                ),
+            )
+            new_status = "ERROR"
+            operation_status = "ERROR"
+
+        connection.execute(
+            """
+            INSERT INTO extension_inventory_events
+                (extension, user_group, event_type, old_status,
+                 new_status, user_name, detail)
+            VALUES (?, ?, 'COMPENSATE', 'RESERVED', ?, ?, ?)
+            """,
+            (
+                payload.extension,
+                payload.user_group,
+                new_status,
+                payload.username.upper(),
+                "idempotency_key=%s" % payload.idempotency_key,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE provisioning_operations
+               SET status=?,
+                   error_text=?,
+                   updated_at=CURRENT_TIMESTAMP
+             WHERE idempotency_key=?
+            """,
+            (
+                operation_status,
+                error_text,
+                payload.idempotency_key,
+            ),
+        )
+        connection.commit()
+    except sqlite3.Error:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def validate_created_phones(cursor, payload, identity, expected_active):
+    enabled_nodes = [node for node in identity["nodes"] if node["enabled"]]
+    expected = dict((node["server_ip"], node) for node in enabled_nodes)
+
+    cursor.execute(
+        """
+        SELECT extension, server_ip, login, dialplan_number, user_group,
+               active, fullname, status
+          FROM phones
+         WHERE extension=%s
+         ORDER BY server_ip
+        """,
+        (payload.extension,),
+    )
+    rows = cursor.fetchall()
+
+    if len(rows) != len(enabled_nodes):
+        raise RuntimeError(
+            "PHONE_COUNT_MISMATCH expected=%d actual=%d"
+            % (len(enabled_nodes), len(rows))
+        )
+
+    seen = set()
+    for row in rows:
+        server_ip = str(row.get("server_ip") or "")
+        node = expected.get(server_ip)
+        if not node:
+            raise RuntimeError("UNEXPECTED_PHONE_SERVER:%s" % server_ip)
+        if server_ip in seen:
+            raise RuntimeError("DUPLICATE_PHONE_SERVER:%s" % server_ip)
+        seen.add(server_ip)
+
+        if str(row.get("login") or "") != node["login"]:
+            raise RuntimeError("PHONE_LOGIN_MISMATCH:%s" % server_ip)
+        if str(row.get("dialplan_number") or "") != node["dialplan_number"]:
+            raise RuntimeError("PHONE_DIALPLAN_MISMATCH:%s" % server_ip)
+        if str(row.get("user_group") or "") != payload.user_group:
+            raise RuntimeError("PHONE_GROUP_MISMATCH:%s" % server_ip)
+        if str(row.get("active") or "") != expected_active:
+            raise RuntimeError("PHONE_ACTIVE_MISMATCH:%s" % server_ip)
+        if str(row.get("status") or "") != "ACTIVE":
+            raise RuntimeError("PHONE_STATUS_MISMATCH:%s" % server_ip)
+
+    return rows
+
+
+def compensate_provisioning(payload, inserted_phones, user_inserted):
+    errors = []
+    cfg = db_config()
+    cfg["autocommit"] = True
+    connection = None
+
+    try:
+        connection = pymysql.connect(**cfg)
+        cursor = connection.cursor()
+
+        if user_inserted:
+            try:
+                cursor.execute(
+                    """
+                    DELETE FROM vicidial_users
+                     WHERE user=%s
+                       AND user_group=%s
+                       AND full_name=%s
+                    """,
+                    (
+                        payload.username.upper(),
+                        payload.user_group,
+                        payload.full_name,
+                    ),
+                )
+            except pymysql.MySQLError as exc:
+                errors.append("USER_COMPENSATION:%s" % exc.__class__.__name__)
+
+        for item in reversed(inserted_phones):
+            try:
+                cursor.execute(
+                    """
+                    DELETE FROM phones
+                     WHERE extension=%s
+                       AND server_ip=%s
+                       AND login=%s
+                       AND user_group=%s
+                    """,
+                    (
+                        payload.extension,
+                        item["server_ip"],
+                        item["login"],
+                        payload.user_group,
+                    ),
+                )
+            except pymysql.MySQLError as exc:
+                errors.append(
+                    "PHONE_COMPENSATION:%s:%s"
+                    % (item["server_ip"], exc.__class__.__name__)
+                )
+    except Exception as exc:
+        errors.append("COMPENSATION_CONNECTION:%s" % exc.__class__.__name__)
+    finally:
+        if connection:
+            connection.close()
+
+    return errors
+
+
+def execute_provisioning(payload):
+    plan = provisioning_write_plan(
+        payload.user_group,
+        payload.username,
+        payload.full_name,
+        payload.extension,
+    )
+    if plan["status"] != "READY":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "WRITE_PLAN_BLOCKED",
+                "blockers": plan["blockers"],
+                "warnings": plan["warnings"],
+            },
+        )
+
+    reservation = reserve_provisioning_operation(payload)
+    if reservation.get("replay"):
+        return reservation["result"]
+
+    # Revalidar después de reservar para cerrar la ventana preview -> ejecución.
+    recheck = provisioning_write_plan(
+        payload.user_group,
+        payload.username,
+        payload.full_name,
+        payload.extension,
+    )
+    if recheck["status"] != "READY":
+        error_text = "REVALIDATION_BLOCKED:%s" % ",".join(recheck["blockers"])
+        release_inventory_after_compensation(payload, error_text, True)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "WRITE_REVALIDATION_BLOCKED",
+                "blockers": recheck["blockers"],
+            },
+        )
+
+    set_provisioning_operation_status(payload.idempotency_key, "RUNNING")
+    agent_password = resolve_agent_password(
+        payload.user_group,
+        payload.agent_pass,
+    )
+    identity = canonical_phone_plan(payload.user_group, payload.extension)
+
+    inserted_phones = []
+    user_inserted = False
+    connection = None
+
+    try:
+        cfg = db_config()
+        cfg["autocommit"] = True
+        connection = pymysql.connect(**cfg)
+        cursor = connection.cursor()
+
+        for node_plan in recheck["phones_plan"]:
+            if node_plan.get("status") != "READY":
+                continue
+            params = [
+                item["value"]
+                for item in node_plan["safe_parameters_in_order"]
+            ]
+            cursor.execute(node_plan["sql_template"], tuple(params))
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "PHONE_INSERT_ROWCOUNT:%s:%s"
+                    % (node_plan["server_ip"], cursor.rowcount)
+                )
+            target_login = None
+            for changed in node_plan["changed_fields"]:
+                if changed["field"] == "login":
+                    target_login = changed["to"]
+                    break
+            inserted_phones.append({
+                "server_ip": node_plan["server_ip"],
+                "login": target_login,
+            })
+
+        staged_rows = validate_created_phones(
+            cursor,
+            payload,
+            identity,
+            "N",
+        )
+
+        user_params = list(recheck["user_plan"]["safe_parameters_in_order"])
+        user_params[1] = agent_password
+        cursor.execute(
+            recheck["user_plan"]["sql_template"],
+            tuple(user_params),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "USER_INSERT_ROWCOUNT:%s" % cursor.rowcount
+            )
+        user_inserted = True
+
+        cursor.execute(
+            """
+            SELECT user, full_name, user_level, user_group, active
+              FROM vicidial_users
+             WHERE user=%s
+             LIMIT 1
+            """,
+            (payload.username.upper(),),
+        )
+        user_row = cursor.fetchone()
+        if not user_row:
+            raise RuntimeError("USER_NOT_FOUND_AFTER_INSERT")
+        if str(user_row.get("user_group") or "") != payload.user_group:
+            raise RuntimeError("USER_GROUP_MISMATCH")
+        if str(user_row.get("full_name") or "") != payload.full_name:
+            raise RuntimeError("USER_FULL_NAME_MISMATCH")
+        if int(user_row.get("user_level") or 0) != 1:
+            raise RuntimeError("USER_LEVEL_MISMATCH")
+        if str(user_row.get("active") or "") != "N":
+            raise RuntimeError("USER_ACTIVE_STAGE_MISMATCH")
+
+        enabled_servers = [
+            node["server_ip"]
+            for node in identity["nodes"]
+            if node["enabled"]
+        ]
+        placeholders = ",".join(["%s"] * len(enabled_servers))
+        cursor.execute(
+            """
+            UPDATE phones
+               SET active='Y'
+             WHERE extension=%s
+               AND user_group=%s
+               AND server_ip IN (%s)
+            """ % placeholders,
+            tuple(
+                [payload.extension, payload.user_group]
+                + enabled_servers
+            ),
+        )
+        if cursor.rowcount != len(enabled_servers):
+            raise RuntimeError(
+                "PHONE_ACTIVATE_ROWCOUNT expected=%d actual=%d"
+                % (len(enabled_servers), cursor.rowcount)
+            )
+
+        cursor.execute(
+            """
+            UPDATE vicidial_users
+               SET active='Y'
+             WHERE user=%s
+               AND user_group=%s
+               AND active='N'
+            """,
+            (payload.username.upper(), payload.user_group),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "USER_ACTIVATE_ROWCOUNT:%s" % cursor.rowcount
+            )
+
+        final_rows = validate_created_phones(
+            cursor,
+            payload,
+            identity,
+            "Y",
+        )
+        cursor.execute(
+            """
+            SELECT user, full_name, user_level, user_group, active
+              FROM vicidial_users
+             WHERE user=%s
+             LIMIT 1
+            """,
+            (payload.username.upper(),),
+        )
+        final_user = cursor.fetchone()
+        if not final_user or str(final_user.get("active") or "") != "Y":
+            raise RuntimeError("USER_FINAL_VALIDATION_FAILED")
+
+        result = {
+            "status": "SUCCESS",
+            "write_performed": True,
+            "idempotency_key": payload.idempotency_key,
+            "user_group": payload.user_group,
+            "username": payload.username.upper(),
+            "full_name": payload.full_name,
+            "extension": payload.extension,
+            "required_nodes": len(final_rows),
+            "phones": [
+                {
+                    "server_ip": str(row.get("server_ip") or ""),
+                    "login": str(row.get("login") or ""),
+                    "dialplan_number": str(row.get("dialplan_number") or ""),
+                    "active": str(row.get("active") or ""),
+                }
+                for row in final_rows
+            ],
+            "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
+        }
+
+        finalize_inventory_in_use(payload, result)
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        compensation_errors = compensate_provisioning(
+            payload,
+            inserted_phones,
+            user_inserted,
+        )
+        compensation_ok = not compensation_errors
+        error_text = "%s:%s" % (exc.__class__.__name__, str(exc))
+        if compensation_errors:
+            error_text += " | " + ",".join(compensation_errors)
+
+        try:
+            release_inventory_after_compensation(
+                payload,
+                error_text,
+                compensation_ok,
+            )
+        except Exception:
+            compensation_ok = False
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PROVISIONING_FAILED",
+                "compensation_ok": compensation_ok,
+                "error": error_text,
+            },
+        )
+    finally:
+        if connection:
+            connection.close()
+
+
 def require_managed_group(user_group):
     managed = set(load_managed_groups())
     if user_group not in managed:
@@ -1167,6 +1850,26 @@ def ensure_inventory_db():
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_extension_events_extension "
                 "ON extension_inventory_events(extension, created_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provisioning_operations (
+                    idempotency_key TEXT PRIMARY KEY,
+                    user_group TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    full_name TEXT NOT NULL,
+                    extension TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    error_text TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_provisioning_operations_target "
+                "ON provisioning_operations(extension, username, status)"
             )
             connection.commit()
         finally:
@@ -1486,6 +2189,11 @@ class WritePlanRequest(BaseModel):
     extension: str = Field(..., min_length=1, max_length=20)
 
 
+class ProvisioningExecuteRequest(WritePlanRequest):
+    idempotency_key: str = Field(..., min_length=8, max_length=128)
+    agent_pass: Optional[str] = Field(None, min_length=1, max_length=100)
+
+
 @app.get("/api/health")
 def health():
     db_ok = False
@@ -1557,6 +2265,8 @@ def health():
         "db_name": row.get("db_name"),
         "db_ok": db_ok,
         "create_enabled": CREATE_ENABLED,
+        "write_executor_enabled": WRITE_EXECUTOR_ENABLED,
+        "write_token_configured": WRITE_TOKEN_FILE.exists(),
         "username_max_length": USERNAME_MAX_LENGTH,
         "python_compat": "3.6+",
         "cors_origins": CORS_ORIGINS,
@@ -1903,6 +2613,20 @@ def provisioning_write_plan_route(payload: WritePlanRequest):
         payload.full_name,
         payload.extension,
     )
+
+
+@app.post("/api/provisioning/execute")
+def provisioning_execute_route(
+    payload: ProvisioningExecuteRequest,
+    request: Request,
+):
+    require_write_execution_gate(request)
+    if not re.match(r"^[A-Za-z0-9._:-]+$", payload.idempotency_key):
+        raise HTTPException(
+            status_code=400,
+            detail="idempotency_key contiene caracteres no permitidos",
+        )
+    return execute_provisioning(payload)
 
 
 @app.post("/api/users/create")
