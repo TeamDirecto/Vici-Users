@@ -1,0 +1,16 @@
+[Unit]
+Description=Vici-Users Asterisk Sync Worker
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/vici-users
+EnvironmentFile=-/etc/sysconfig/vici-users
+ExecStart=/opt/vici-users/.venv/bin/python /opt/vici-users/backend/asterisk_sync_worker.py
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
