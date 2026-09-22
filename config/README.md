@@ -320,3 +320,28 @@ VICI_USERS_PORTAL_WRITE_ENABLED=false
 
 un operador puede autenticarse y validar la integración sin habilitar
 escrituras desde GitHub Pages.
+
+
+### API del portal protegida por sesión
+
+Después de integrar la autenticación, las rutas operativas del portal requieren
+un token Bearer válido. Permanecen públicas únicamente las rutas necesarias
+para arrancar y autenticar:
+
+```text
+GET  /api/health
+POST /api/auth/login
+```
+
+`/api/auth/me` y `/api/auth/logout` requieren sesión. También requieren
+sesión los grupos, plantillas, inventario, auditoría, preview y dry-runs.
+
+Los endpoints de diagnóstico detallado de usuarios requieren rol `admin`.
+Las funciones normales de consulta y preview aceptan `operator` o `admin`.
+
+El frontend guarda el token exclusivamente en `sessionStorage`, por lo que
+no persiste entre sesiones completas del navegador. El password de operador
+nunca se guarda en el navegador después del login.
+
+La escritura del portal continúa bloqueada independientemente de la sesión
+mientras `VICI_USERS_PORTAL_WRITE_ENABLED=false`.
