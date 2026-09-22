@@ -3959,12 +3959,12 @@ def execute_group_change(payload, preview):
             """,
             (source_extension, source_group),
         )
+        source_deactivated = True
         if cursor.rowcount < len(source_enabled_servers):
             raise RuntimeError(
                 "GROUP_CHANGE_SOURCE_PHONE_DEACTIVATE_ROWCOUNT expected_at_least=%d actual=%d"
                 % (len(source_enabled_servers), cursor.rowcount)
             )
-        source_deactivated = True
 
         if source_alias_snapshot:
             cursor.execute(
