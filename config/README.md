@@ -345,3 +345,44 @@ nunca se guarda en el navegador después del login.
 
 La escritura del portal continúa bloqueada independientemente de la sesión
 mientras `VICI_USERS_PORTAL_WRITE_ENABLED=false`.
+
+
+## CP4: alta individual desde el portal
+
+El portal dispone de una ruta separada del ejecutor local:
+
+```text
+POST /api/provisioning/portal-execute
+```
+
+Requiere simultáneamente:
+
+```text
+sesión Bearer válida
+role = admin
+VICI_USERS_ENABLE_CREATE=true
+VICI_USERS_PORTAL_WRITE_ENABLED=true
+```
+
+El ejecutor local `/api/provisioning/execute` conserva su propio token y la
+restricción localhost; no se reutiliza ese secreto en el navegador.
+
+La primera versión del flujo web permite exactamente una persona por
+operación. El botón sólo se habilita cuando el preview contiene un único usuario
+`AVAILABLE`, una extensión asignada y la extensión no proviene de `FREE`.
+El reciclaje de extensiones sigue fuera de alcance del ejecutor v1.
+
+Antes de ejecutar, el operador debe confirmar escribiendo `CREAR`. El
+frontend genera una `idempotency_key` y la conserva para reintentos de la misma
+operación si hubiera timeout o pérdida de respuesta.
+
+El backend registra en `auth_audit`:
+
+```text
+PROVISIONING_REQUEST
+PROVISIONING_SUCCESS
+PROVISIONING_BLOCKED
+PROVISIONING_FAILED
+```
+
+sin registrar passwords ni secretos del phone.
