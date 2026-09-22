@@ -265,3 +265,58 @@ disponibilidad del usuario/extensión y sin ejecutar nuevas escrituras.
 Esto cubre reintentos causados por timeouts o pérdida de respuesta después de
 una operación ya completada. Una misma clave con payload diferente sigue
 bloqueada con `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`.
+
+
+## Autenticación de operadores del portal
+
+La autenticación del portal vive completamente en `vici97`. No se guardan
+usuarios, passwords ni tokens en GitHub Pages.
+
+Configuración privada:
+
+```text
+/etc/vici-users/operators.json
+```
+
+El archivo debe ser `root:root 0600`. Los passwords se almacenan como
+PBKDF2-HMAC-SHA256 con salt aleatorio y 260000 iteraciones.
+
+El helper público:
+
+```bash
+./configure-operator.sh <usuario> [operator|admin]
+```
+
+solicita el password de forma interactiva y nunca lo imprime ni lo escribe en
+el repositorio.
+
+Endpoints de sesión:
+
+```text
+POST /api/auth/login
+GET  /api/auth/me
+POST /api/auth/logout
+```
+
+El login devuelve un token Bearer aleatorio. El backend guarda únicamente el
+SHA-256 del token en SQLite. La sesión expira por defecto a los 1800 segundos y
+puede configurarse con `VICI_USERS_AUTH_SESSION_TTL`.
+
+Las sesiones y eventos de autenticación quedan en:
+
+```text
+auth_sessions
+auth_audit
+```
+
+Después de 5 credenciales incorrectas para el mismo usuario dentro de 15
+minutos, el login se bloquea temporalmente con HTTP 429.
+
+La creación desde navegador sigue separada del ejecutor local. Mientras:
+
+```text
+VICI_USERS_PORTAL_WRITE_ENABLED=false
+```
+
+un operador puede autenticarse y validar la integración sin habilitar
+escrituras desde GitHub Pages.
