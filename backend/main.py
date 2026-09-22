@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.16.0-operator-auth")
+app = FastAPI(title="Vici-Users API", version="0.16.1-auth-protected-api")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2746,7 +2746,8 @@ def health():
 
 
 @app.get("/api/groups")
-def groups():
+def groups(request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     templates = load_group_templates()
     defaults = load_group_defaults()
     ranges = load_extension_ranges()
@@ -2780,7 +2781,8 @@ def groups():
 
 
 @app.get("/api/groups/{user_group}/template")
-def group_template(user_group):
+def group_template(user_group, request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     require_managed_group(user_group)
     templates = load_group_templates()
     defaults = load_group_defaults()
@@ -2817,7 +2819,8 @@ def group_template(user_group):
 
 
 @app.get("/api/groups/{user_group}/users")
-def group_users(user_group):
+def group_users(user_group, request: Request):
+    require_operator_session(request, allowed_roles={"admin"})
     require_managed_group(user_group)
     # Endpoint de diagnóstico/configuración. El front operativo no lo usa.
     with db_cursor() as cursor:
@@ -2835,7 +2838,8 @@ def group_users(user_group):
 
 
 @app.get("/api/users/{user}")
-def user_detail(user):
+def user_detail(user, request: Request):
+    require_operator_session(request, allowed_roles={"admin"})
     with db_cursor() as cursor:
         cursor.execute(
             """
@@ -2855,7 +2859,8 @@ def user_detail(user):
 
 
 @app.get("/api/groups/{user_group}/extension-range")
-def group_extension_range(user_group):
+def group_extension_range(user_group, request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     extension_range = require_provisioning_group(user_group)
     return {
         "user_group": user_group,
@@ -2865,22 +2870,26 @@ def group_extension_range(user_group):
 
 
 @app.get("/api/groups/{user_group}/extensions/inventory")
-def group_extension_inventory(user_group):
+def group_extension_inventory(user_group, request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     return extension_inventory_snapshot(user_group)
 
 
 @app.get("/api/groups/{user_group}/extensions/{extension}/plan")
-def group_extension_plan(user_group, extension):
+def group_extension_plan(user_group, extension, request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     return canonical_phone_plan(user_group, extension)
 
 
 @app.get("/api/groups/{user_group}/extensions/{extension}/provisioning-plan")
-def group_extension_provisioning_plan(user_group, extension):
+def group_extension_provisioning_plan(user_group, extension, request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     return phone_provisioning_dry_run(user_group, extension)
 
 
 @app.get("/api/extensions/audit")
-def extension_audit():
+def extension_audit(request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     ranges = load_extension_ranges()
     managed_groups = load_managed_groups()
     order = dict((group, idx) for idx, group in enumerate(managed_groups))
@@ -2918,7 +2927,8 @@ def extension_audit():
 
 
 @app.post("/api/users/preview")
-def preview_users(payload: PreviewRequest):
+def preview_users(payload: PreviewRequest, request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     extension_range = require_provisioning_group(payload.user_group)
     template = get_group_template(payload.user_group)
     if not template:
@@ -3060,7 +3070,8 @@ def preview_users(payload: PreviewRequest):
 
 
 @app.post("/api/provisioning/write-plan")
-def provisioning_write_plan_route(payload: WritePlanRequest):
+def provisioning_write_plan_route(payload: WritePlanRequest, request: Request):
+    require_operator_session(request, allowed_roles={"operator", "admin"})
     return provisioning_write_plan(
         payload.user_group,
         payload.username,
@@ -3084,7 +3095,8 @@ def provisioning_execute_route(
 
 
 @app.post("/api/users/create")
-def create_users(payload: CreateRequest):
+def create_users(payload: CreateRequest, request: Request):
+    require_operator_session(request, allowed_roles={"admin"})
     require_provisioning_group(payload.user_group)
     if not CREATE_ENABLED:
         raise HTTPException(
