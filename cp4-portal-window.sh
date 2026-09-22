@@ -149,7 +149,7 @@ assert disabled == ["172.20.21.94"], ".94 debe ser el único nodo excluido: %s" 
 print("[OK] DB y topología 4/4; 172.20.21.94 excluido")
 PY
 
-log "Validando topología de extensiones administradas por el portal..."
+log "Validando phones + phones_alias de extensiones administradas por el portal..."
 "$PY" - <<'PY'
 import sqlite3
 
@@ -157,11 +157,10 @@ from backend.main import db_cursor, load_cluster_nodes
 
 DB = "/var/lib/vici-users/extension_inventory.db"
 topology = load_cluster_nodes()
-enabled = set(
-    node["server_ip"]
-    for node in topology["nodes"]
-    if node["enabled"]
-)
+enabled_nodes = [
+    node for node in topology["nodes"] if node["enabled"]
+]
+enabled = set(node["server_ip"] for node in enabled_nodes)
 
 local = sqlite3.connect(DB)
 local.row_factory = sqlite3.Row
@@ -215,25 +214,94 @@ with db_cursor() as cursor:
             and str(row.get("active") or "").upper() != "Y"
         )
 
-        if missing or wrong_group or inactive:
+        cursor.execute(
+            """
+            SELECT alias_id, alias_name, logins_list, user_group
+              FROM phones_alias
+             WHERE alias_id=%s
+             LIMIT 1
+            """,
+            (extension,),
+        )
+        alias = cursor.fetchone()
+
+        expected_logins = [
+            extension + str(node["login_suffix"])
+            for node in enabled_nodes
+        ]
+        alias_missing = alias is None
+        alias_identity_bad = False
+        alias_missing_logins = []
+        alias_actual_logins = []
+
+        if alias:
+            alias_actual_logins = [
+                value.strip()
+                for value in str(alias.get("logins_list") or "").split(",")
+                if value.strip()
+            ]
+            alias_identity_bad = (
+                str(alias.get("alias_id") or "") != extension
+                or str(alias.get("alias_name") or "") != extension
+                or str(alias.get("user_group") or "") != "---ALL---"
+            )
+            alias_missing_logins = [
+                login for login in expected_logins
+                if login not in alias_actual_logins
+            ]
+
+        if (
+            missing
+            or wrong_group
+            or inactive
+            or alias_missing
+            or alias_identity_bad
+            or alias_missing_logins
+        ):
             bad.append(
-                (group, extension, item["current_user"], missing, wrong_group, inactive)
+                (
+                    group,
+                    extension,
+                    item["current_user"],
+                    missing,
+                    wrong_group,
+                    inactive,
+                    alias_missing,
+                    alias_identity_bad,
+                    alias_missing_logins,
+                    alias_actual_logins,
+                )
             )
 
 if bad:
-    print("[ERROR] Hay extensiones IN_USE del portal que no están sanas en los nodos habilitados:")
-    for group, extension, user, missing, wrong_group, inactive in bad:
+    print("[ERROR] Hay extensiones IN_USE del portal con phones/alias incompletos:")
+    for (
+        group,
+        extension,
+        user,
+        missing,
+        wrong_group,
+        inactive,
+        alias_missing,
+        alias_identity_bad,
+        alias_missing_logins,
+        alias_actual_logins,
+    ) in bad:
         print("")
-        print("  grupo     :", group)
-        print("  extension :", extension)
-        print("  usuario   :", user)
-        print("  faltantes :", ",".join(missing) or "-")
-        print("  otro grupo:", ",".join(wrong_group) or "-")
-        print("  inactivos :", ",".join(inactive) or "-")
+        print("  grupo          :", group)
+        print("  extension      :", extension)
+        print("  usuario        :", user)
+        print("  phones faltan  :", ",".join(missing) or "-")
+        print("  otro grupo     :", ",".join(wrong_group) or "-")
+        print("  phones inactivos:", ",".join(inactive) or "-")
+        print("  alias ausente  :", alias_missing)
+        print("  alias identidad:", "ERROR" if alias_identity_bad else "OK")
+        print("  alias logins faltantes:", ",".join(alias_missing_logins) or "-")
+        print("  alias logins actuales :", ",".join(alias_actual_logins) or "-")
     raise SystemExit(20)
 
 print(
-    "[OK] %d extensión(es) IN_USE administradas por portal sanas en 4/4 nodos habilitados"
+    "[OK] %d extensión(es) IN_USE sanas en phones 4/4 y phones_alias"
     % len(managed)
 )
 PY
