@@ -253,3 +253,15 @@ cuando llegue el momento de habilitar escritura.
 El token de escritura es un candado operativo temporal para pruebas locales; no
 debe incrustarse en JavaScript/GitHub Pages. La autenticación de usuario final
 del portal debe resolverse antes de habilitar creación desde navegador.
+
+
+### Replay idempotente después de SUCCESS
+
+El ejecutor consulta `provisioning_operations` por `idempotency_key` antes
+de regenerar el write-plan. Si la clave ya terminó en `SUCCESS` y el payload
+coincide exactamente, devuelve el resultado guardado sin volver a evaluar la
+disponibilidad del usuario/extensión y sin ejecutar nuevas escrituras.
+
+Esto cubre reintentos causados por timeouts o pérdida de respuesta después de
+una operación ya completada. Una misma clave con payload diferente sigue
+bloqueada con `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`.
