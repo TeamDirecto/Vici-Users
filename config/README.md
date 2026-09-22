@@ -218,3 +218,38 @@ ping_time      = NULL
 La configuración funcional (WebRTC, template_id, conf_secret, contextos,
 codecs y demás campos no dinámicos) se sigue clonando desde la plantilla del
 mismo nodo.
+
+
+## Ejecutor real de provisión (cerrado por defecto)
+
+El backend ya contiene un ejecutor real para una alta individual
+usuario + extensión, pero permanece bloqueado por tres barreras:
+
+```text
+VICI_USERS_ENABLE_CREATE=false
+VICI_USERS_WRITE_EXECUTOR_ENABLED=false
+/etc/vici-users/write_token   (fuera de GitHub)
+```
+
+La ruta de ejecución es `POST /api/provisioning/execute`. Aunque el código de
+escritura exista, no debe habilitarse todavía desde el frontend público.
+
+El ejecutor usa:
+
+- `idempotency_key` obligatorio para impedir reintentos duplicados;
+- reserva SQLite con `BEGIN IMMEDIATE`;
+- journal local `provisioning_operations`;
+- phones creados primero con `active=N`;
+- validación exacta de los 4 nodos;
+- usuario creado con `active=N`;
+- activación sólo después de validar ambos lados;
+- inventario final `IN_USE`;
+- compensación explícita de usuario y phones si falla una operación MyISAM.
+
+La reutilización de extensiones `FREE` queda intencionalmente bloqueada en
+esta primera versión del ejecutor. Sólo se permite el camino `UNCREATED`
+cuando llegue el momento de habilitar escritura.
+
+El token de escritura es un candado operativo temporal para pruebas locales; no
+debe incrustarse en JavaScript/GitHub Pages. La autenticación de usuario final
+del portal debe resolverse antes de habilitar creación desde navegador.
