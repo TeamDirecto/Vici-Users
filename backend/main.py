@@ -2694,6 +2694,13 @@ def health():
         disabled_nodes_count = 0
         cluster_topology_ok = False
 
+    try:
+        operator_count = len(load_operators())
+        operators_ok = True
+    except HTTPException:
+        operator_count = 0
+        operators_ok = False
+
     return {
         "status": "ok" if db_ok else "degraded",
         "app_node": socket.gethostname(),
@@ -2708,7 +2715,10 @@ def health():
         "write_executor_enabled": WRITE_EXECUTOR_ENABLED,
         "write_executor_local_only": WRITE_EXECUTOR_LOCAL_ONLY,
         "write_token_configured": WRITE_TOKEN_FILE.exists(),
-        "operators_configured": bool(load_operators()) if OPERATORS_FILE.exists() else False,
+        "operators_file": str(OPERATORS_FILE),
+        "operators_ok": operators_ok,
+        "operators_count": operator_count,
+        "operators_configured": operator_count > 0,
         "portal_write_enabled": PORTAL_WRITE_ENABLED,
         "auth_session_ttl": AUTH_SESSION_TTL,
         "username_max_length": USERNAME_MAX_LENGTH,
