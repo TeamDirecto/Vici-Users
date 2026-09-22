@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.16.1-auth-protected-api")
+app = FastAPI(title="Vici-Users API", version="0.17.0-portal-confirmation")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1371,6 +1371,27 @@ def preview_extension_allocations(user_group, requested):
         "allocations": allocations,
         "rejected": rejected,
     }
+
+
+def require_portal_write_gate(request):
+    session = require_operator_session(
+        request,
+        allowed_roles={"admin"},
+    )
+
+    if not PORTAL_WRITE_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="PORTAL_WRITE_DISABLED",
+        )
+
+    if not CREATE_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="CREATE_DISABLED",
+        )
+
+    return session
 
 
 def require_write_execution_gate(request):
@@ -3078,6 +3099,62 @@ def provisioning_write_plan_route(payload: WritePlanRequest, request: Request):
         payload.full_name,
         payload.extension,
     )
+
+
+@app.post("/api/provisioning/portal-execute")
+def portal_provisioning_execute_route(
+    payload: ProvisioningExecuteRequest,
+    request: Request,
+):
+    session = require_portal_write_gate(request)
+
+    if not re.match(r"^[A-Za-z0-9._:-]+$", payload.idempotency_key):
+        raise HTTPException(
+            status_code=400,
+            detail="idempotency_key contiene caracteres no permitidos",
+        )
+
+    audit_detail = (
+        "idempotency_key=%s user_group=%s username=%s extension=%s"
+        % (
+            payload.idempotency_key,
+            payload.user_group,
+            payload.username.upper(),
+            payload.extension,
+        )
+    )
+    record_auth_event(
+        session["username"],
+        "PROVISIONING_REQUEST",
+        request,
+        audit_detail,
+    )
+
+    try:
+        result = execute_provisioning(payload)
+    except HTTPException as exc:
+        event_type = (
+            "PROVISIONING_FAILED"
+            if int(exc.status_code) >= 500
+            else "PROVISIONING_BLOCKED"
+        )
+        record_auth_event(
+            session["username"],
+            event_type,
+            request,
+            audit_detail + " http_status=%s" % exc.status_code,
+        )
+        raise
+
+    record_auth_event(
+        session["username"],
+        "PROVISIONING_SUCCESS",
+        request,
+        audit_detail,
+    )
+    result["requested_by"] = session["username"]
+    result["request_source"] = "PORTAL"
+    return result
 
 
 @app.post("/api/provisioning/execute")
