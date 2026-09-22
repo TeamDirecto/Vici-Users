@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.18.0-group-change-preview")
+app = FastAPI(title="Vici-Users API", version="0.18.1-group-change-password-preview")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2993,10 +2993,14 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
         "target_template_user": target_template_user,
         "preserved_fields": [
             "user",
-            "pass",
             "full_name",
             "active",
         ],
+        "password_change": {
+            "action": "REPLACE_WITH_TARGET_GROUP_DEFAULT",
+            "target_default_configured": target_group in load_group_defaults(),
+            "password_exposed": False,
+        },
         "permission_fields_total": len(USER_CLONE_FIELDS),
         "permission_fields_changed": len(changed_permission_fields),
         "changed_permission_fields": changed_permission_fields,
@@ -3006,6 +3010,7 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
         "execution_enabled": False,
         "execution_note": (
             "Preview-only. El cambio real todavía no está habilitado; "
+            "la contraseña se reemplazará por el default del grupo destino y "
             "las extensiones administradas no se modifican en este endpoint."
         ),
     }
