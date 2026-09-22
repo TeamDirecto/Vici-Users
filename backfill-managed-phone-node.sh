@@ -8,6 +8,7 @@ PY="${APP}/.venv/bin/python"
 GROUP="${1:-CC-CORTIZO-VW}"
 EXTENSION="${2:-95217}"
 TARGET_SERVER="${3:-172.20.21.94}"
+MODE="${4:-dry-run}"
 
 [ "$(id -u)" -eq 0 ] || { echo "[ERROR] Ejecuta como root" >&2; exit 1; }
 [ "$(hostname -s 2>/dev/null || hostname)" = "$EXPECTED_HOST" ] || {
@@ -18,7 +19,7 @@ TARGET_SERVER="${3:-172.20.21.94}"
 
 cd "$APP"
 
-"$PY" - "$GROUP" "$EXTENSION" "$TARGET_SERVER" <<'PY'
+"$PY" - "$GROUP" "$EXTENSION" "$TARGET_SERVER" "$MODE" <<'PY'
 from __future__ import print_function
 
 import sys
@@ -33,11 +34,17 @@ from backend.main import (
     load_extension_ranges,
 )
 
-group, extension, target_server = sys.argv[1:4]
+group, extension, target_server, mode = sys.argv[1:5]
 
-if group not in load_extension_ranges():
+if mode not in {"dry-run", "--apply"}:
+    raise SystemExit("[ERROR] Modo inválido. Usa dry-run o --apply")
+
+ranges = load_extension_ranges()
+
+if group not in ranges:
     raise SystemExit("[ERROR] Grupo sin bloque de extensiones configurado: %s" % group)
 
+extension_range = ranges[group]
 identity = canonical_phone_plan(group, extension)
 target = None
 for node in identity["nodes"]:
@@ -148,10 +155,17 @@ with db_cursor() as cursor:
          WHERE user_group=%s
            AND server_ip=%s
            AND active='Y'
+           AND extension >= %s
+           AND extension <= %s
          ORDER BY extension
          LIMIT 1
         """,
-        (group, target_server),
+        (
+            group,
+            target_server,
+            str(extension_range["start"]),
+            str(extension_range["end"]),
+        ),
     )
     source_meta = cursor.fetchone()
 
@@ -198,6 +212,16 @@ print("     plantilla :", source_extension)
 print("     login src :", source_meta["login"])
 print("     dial src  :", source_meta["dialplan_number"])
 print("     target    :", expected_login, "/", expected_dialplan)
+print("     modo      :", mode)
+
+if mode != "--apply":
+    print("")
+    print("[DRY-RUN] Precheck limpio. No se ejecutó INSERT/UPDATE/DELETE.")
+    print(
+        "[DRY-RUN] Para aplicar: backfill-managed-phone-node.sh %s %s %s --apply"
+        % (group, extension, target_server)
+    )
+    raise SystemExit(0)
 
 override_values = {
     "extension": extension,
