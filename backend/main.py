@@ -4364,6 +4364,7 @@ def preview_users(payload: PreviewRequest, request: Request):
     extension_preview = preview_extension_allocations(
         payload.user_group,
         len(available_rows),
+        allow_free=False,
     )
     allocations = list(extension_preview["allocations"])
 
