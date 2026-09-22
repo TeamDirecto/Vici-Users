@@ -192,3 +192,29 @@ fullname destino: <mismo formato con 95217>
 
 `fullname` pasa a formar parte del conjunto explícito de campos de identidad
 del teléfono y deja de copiarse sin transformación.
+
+
+### Estado operativo limpio para phones nuevos
+
+El análisis de extensiones sanas confirmó que algunos campos reflejan estado
+operativo y no deben heredarse desde la extensión plantilla.
+
+Para altas nuevas el plan inicializa explícitamente:
+
+```text
+status         = ACTIVE
+active         = N            # hasta validar el alta completa
+phone_ip       = NULL
+computer_ip    = NULL
+messages       = 0
+old_messages   = 0
+login_user     = NULL
+login_pass     = NULL
+login_campaign = NULL
+peer_status    = UNKNOWN
+ping_time      = NULL
+```
+
+La configuración funcional (WebRTC, template_id, conf_secret, contextos,
+codecs y demás campos no dinámicos) se sigue clonando desde la plantilla del
+mismo nodo.
