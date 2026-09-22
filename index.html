@@ -125,8 +125,9 @@
               <div><span>BASE destino</span><strong id="gcBase">—</strong></div>
               <div><span>User level destino</span><strong id="gcLevel">—</strong></div>
               <div><span>Contraseña destino</span><strong id="gcPasswordAction">—</strong></div>
-              <div><span>Extensión administrada</span><strong id="gcExtension">—</strong></div>
-              <div><span>Permisos que cambiarían</span><strong id="gcPermissionCount">—</strong></div>
+              <div><span>Extensión actual</span><strong id="gcExtension">—</strong></div>
+              <div><span>Extensión destino propuesta</span><strong id="gcTargetExtension">—</strong></div>
+              <div><span>Diferencias vs BASE destino</span><strong id="gcPermissionCount">—</strong></div>
             </div>
             <div class="rule" id="gcDetail">—</div>
             <div class="btns">
@@ -721,11 +722,18 @@
 
       const extensions=(data.managed_extensions||[]).map(x=>x.extension+' ('+x.user_group+')');
       $('gcExtension').textContent=extensions.length?extensions.join(', '):'No administrada por portal';
+
+      const targetAllocation=data.target_extension_allocation||null;
+      $('gcTargetExtension').textContent=targetAllocation
+        ? targetAllocation.extension+' · '+targetAllocation.action
+        : 'Sin consecutivo UNCREATED disponible';
+
       $('gcPermissionCount').textContent=String(data.permission_fields_changed||0)+' / '+String(data.permission_fields_total||0);
 
       const changed=(data.changed_permission_fields||[]);
-      $('gcDetail').innerHTML='<strong>Campos de permisos que cambiarían:</strong><br>'+
-        (changed.length?escapeHtml(changed.join(', ')):'Ninguno');
+      $('gcDetail').innerHTML='<strong>Diferencias de permisos respecto al BASE destino:</strong><br>'+
+        (changed.length?escapeHtml(changed.join(', ')):'Ninguna')+
+        '<br><br><strong>Regla de migración:</strong> sólo se propone una extensión UNCREATED dentro del bloque destino; FREE no se reutiliza en esta etapa.';
 
       const blockers=data.blockers||[];
       $('groupChangeBlocker').textContent=blockers.length?'Bloqueado: '+blockers.join(', '):'';
