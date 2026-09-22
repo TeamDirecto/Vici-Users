@@ -110,7 +110,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.15.0-provisioning-executor")
+app = FastAPI(title="Vici-Users API", version="0.15.1-provisioning-executor")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1562,6 +1562,13 @@ def execute_provisioning(payload):
             },
         )
 
+    # Resolver credenciales antes de reservar para no dejar RESERVED
+    # si la configuración server-side está incompleta.
+    agent_password = resolve_agent_password(
+        payload.user_group,
+        payload.agent_pass,
+    )
+
     reservation = reserve_provisioning_operation(payload)
     if reservation.get("replay"):
         return reservation["result"]
@@ -1584,11 +1591,6 @@ def execute_provisioning(payload):
             },
         )
 
-    set_provisioning_operation_status(payload.idempotency_key, "RUNNING")
-    agent_password = resolve_agent_password(
-        payload.user_group,
-        payload.agent_pass,
-    )
     identity = canonical_phone_plan(payload.user_group, payload.extension)
 
     inserted_phones = []
@@ -1596,6 +1598,7 @@ def execute_provisioning(payload):
     connection = None
 
     try:
+        set_provisioning_operation_status(payload.idempotency_key, "RUNNING")
         cfg = db_config()
         cfg["autocommit"] = True
         connection = pymysql.connect(**cfg)
@@ -1670,14 +1673,13 @@ def execute_provisioning(payload):
             if node["enabled"]
         ]
         placeholders = ",".join(["%s"] * len(enabled_servers))
+        activate_sql = (
+            "UPDATE phones SET active='Y' "
+            "WHERE extension=%s AND user_group=%s "
+            "AND server_ip IN (" + placeholders + ")"
+        )
         cursor.execute(
-            """
-            UPDATE phones
-               SET active='Y'
-             WHERE extension=%s
-               AND user_group=%s
-               AND server_ip IN (%s)
-            """ % placeholders,
+            activate_sql,
             tuple(
                 [payload.extension, payload.user_group]
                 + enabled_servers
