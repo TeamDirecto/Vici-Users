@@ -4,8 +4,11 @@ import re
 import secrets
 import socket
 import sqlite3
+import hashlib
+import stat
 import unicodedata
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -31,6 +34,16 @@ WRITE_TOKEN_FILE = Path(
         "/etc/vici-users/write_token",
     )
 )
+OPERATORS_FILE = Path(
+    os.getenv(
+        "VICI_USERS_OPERATORS_FILE",
+        "/etc/vici-users/operators.json",
+    )
+)
+AUTH_SESSION_TTL = int(os.getenv("VICI_USERS_AUTH_SESSION_TTL", "1800"))
+PORTAL_WRITE_ENABLED = os.getenv(
+    "VICI_USERS_PORTAL_WRITE_ENABLED", "false"
+).lower() in {"1", "true", "yes", "y"}
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
 GROUP_TEMPLATES_FILE = Path(
     os.getenv("VICI_USERS_GROUP_TEMPLATES_FILE", "/etc/vici-users/group_templates.json")
@@ -113,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.15.3-idempotent-replay")
+app = FastAPI(title="Vici-Users API", version="0.16.0-operator-auth")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -121,6 +134,254 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+
+def load_operators():
+    if not OPERATORS_FILE.exists():
+        return {}
+
+    try:
+        mode = stat.S_IMODE(OPERATORS_FILE.stat().st_mode)
+        if mode & 0o077:
+            raise HTTPException(
+                status_code=503,
+                detail="operators.json debe tener permisos 0600 o más restrictivos",
+            )
+
+        with OPERATORS_FILE.open("r") as fh:
+            data = json.load(fh)
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Configuración de operadores inválida: %s" % exc,
+        )
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=503,
+            detail="operators.json debe contener un objeto JSON",
+        )
+
+    clean = {}
+    for username, item in data.items():
+        username = str(username).strip()
+        if not username or not isinstance(item, dict):
+            continue
+        try:
+            iterations = int(item.get("iterations") or 0)
+        except (TypeError, ValueError):
+            iterations = 0
+
+        clean[username] = {
+            "active": bool(item.get("active", True)),
+            "role": str(item.get("role") or "operator").strip().lower(),
+            "salt": str(item.get("salt") or "").strip().lower(),
+            "password_hash": str(item.get("password_hash") or "").strip().lower(),
+            "iterations": iterations,
+        }
+    return clean
+
+
+def _auth_token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _verify_operator_password(operator, password):
+    salt_hex = operator.get("salt") or ""
+    expected_hex = operator.get("password_hash") or ""
+    iterations = int(operator.get("iterations") or 0)
+
+    if iterations < 100000 or not salt_hex or not expected_hex:
+        return False
+
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(expected_hex)
+    except ValueError:
+        return False
+
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return secrets.compare_digest(candidate, expected)
+
+
+def _request_audit_address(request):
+    forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    if forwarded:
+        return forwarded[:128]
+    if request.client:
+        return str(request.client.host or "")[:128]
+    return ""
+
+
+def record_auth_event(username, event_type, request, detail=None):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute(
+            """
+            INSERT INTO auth_audit
+                (username, event_type, remote_addr, user_agent, detail)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(username or "")[:128],
+                str(event_type or "")[:64],
+                _request_audit_address(request),
+                str(request.headers.get("user-agent") or "")[:500],
+                str(detail or "")[:1000],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def recent_failed_logins(username):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        row = connection.execute(
+            """
+            SELECT COUNT(*)
+              FROM auth_audit
+             WHERE username=?
+               AND event_type='LOGIN_FAILED'
+               AND created_at >= datetime('now', '-15 minutes')
+            """,
+            (username,),
+        ).fetchone()
+        return int(row[0] or 0)
+    finally:
+        connection.close()
+
+
+def create_auth_session(username, role, request):
+    ensure_inventory_db()
+    token = secrets.token_urlsafe(32)
+    token_hash = _auth_token_hash(token)
+    now = datetime.utcnow()
+    expires = now + timedelta(seconds=AUTH_SESSION_TTL)
+
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute(
+            """
+            INSERT INTO auth_sessions
+                (token_hash, username, role, created_at, expires_at,
+                 last_seen_at, remote_addr, user_agent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                token_hash,
+                username,
+                role,
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                expires.strftime("%Y-%m-%d %H:%M:%S"),
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                _request_audit_address(request),
+                str(request.headers.get("user-agent") or "")[:500],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    return token, expires
+
+
+def require_operator_session(request, allowed_roles=None):
+    authorization = str(request.headers.get("authorization") or "")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
+
+    token_hash = _auth_token_hash(token)
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            """
+            SELECT token_hash, username, role, expires_at, revoked_at
+              FROM auth_sessions
+             WHERE token_hash=?
+            """,
+            (token_hash,),
+        ).fetchone()
+
+        if not row or row["revoked_at"]:
+            raise HTTPException(status_code=401, detail="AUTH_SESSION_INVALID")
+
+        try:
+            expires_at = datetime.strptime(
+                str(row["expires_at"]),
+                "%Y-%m-%d %H:%M:%S",
+            )
+        except ValueError:
+            raise HTTPException(status_code=401, detail="AUTH_SESSION_INVALID")
+
+        if expires_at <= datetime.utcnow():
+            connection.execute(
+                """
+                UPDATE auth_sessions
+                   SET revoked_at=CURRENT_TIMESTAMP
+                 WHERE token_hash=?
+                """,
+                (token_hash,),
+            )
+            connection.commit()
+            raise HTTPException(status_code=401, detail="AUTH_SESSION_EXPIRED")
+
+        role = str(row["role"] or "operator")
+        if allowed_roles and role not in allowed_roles:
+            raise HTTPException(status_code=403, detail="AUTH_ROLE_FORBIDDEN")
+
+        connection.execute(
+            """
+            UPDATE auth_sessions
+               SET last_seen_at=CURRENT_TIMESTAMP
+             WHERE token_hash=?
+            """,
+            (token_hash,),
+        )
+        connection.commit()
+
+        return {
+            "username": str(row["username"]),
+            "role": role,
+            "expires_at": str(row["expires_at"]),
+            "token_hash": token_hash,
+        }
+    finally:
+        connection.close()
+
+
+def revoke_auth_session(session, request):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute(
+            """
+            UPDATE auth_sessions
+               SET revoked_at=CURRENT_TIMESTAMP
+             WHERE token_hash=?
+            """,
+            (session["token_hash"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    record_auth_event(session["username"], "LOGOUT", request)
 
 
 def _read_astguiclient_conf():
@@ -1943,6 +2204,42 @@ def ensure_inventory_db():
                 "CREATE INDEX IF NOT EXISTS idx_provisioning_operations_target "
                 "ON provisioning_operations(extension, username, status)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    remote_addr TEXT,
+                    user_agent TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user "
+                "ON auth_sessions(username, expires_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    event_type TEXT NOT NULL,
+                    remote_addr TEXT,
+                    user_agent TEXT,
+                    detail TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auth_audit_user_date "
+                "ON auth_audit(username, created_at)"
+            )
             connection.commit()
         finally:
             connection.close()
@@ -2238,6 +2535,11 @@ def resolve_agent_password(user_group, override_password=None):
     return password
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
 class PersonIn(BaseModel):
     first_names: str = Field(..., min_length=1, max_length=120)
     paternal: str = Field(..., min_length=1, max_length=80)
@@ -2264,6 +2566,72 @@ class WritePlanRequest(BaseModel):
 class ProvisioningExecuteRequest(WritePlanRequest):
     idempotency_key: str = Field(..., min_length=8, max_length=128)
     agent_pass: Optional[str] = Field(None, min_length=1, max_length=100)
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: LoginRequest, request: Request):
+    username = payload.username.strip()
+    operators = load_operators()
+    operator = operators.get(username)
+
+    if recent_failed_logins(username) >= 5:
+        record_auth_event(username, "LOGIN_RATE_LIMITED", request)
+        raise HTTPException(
+            status_code=429,
+            detail="AUTH_TOO_MANY_ATTEMPTS",
+        )
+
+    if (
+        not operator
+        or not operator.get("active")
+        or operator.get("role") not in {"operator", "admin"}
+        or not _verify_operator_password(operator, payload.password)
+    ):
+        record_auth_event(username, "LOGIN_FAILED", request)
+        raise HTTPException(status_code=401, detail="AUTH_INVALID_CREDENTIALS")
+
+    token, expires = create_auth_session(
+        username,
+        operator.get("role") or "operator",
+        request,
+    )
+    record_auth_event(username, "LOGIN_SUCCESS", request)
+
+    return {
+        "authenticated": True,
+        "username": username,
+        "role": operator.get("role") or "operator",
+        "expires_at": expires.strftime("%Y-%m-%d %H:%M:%S"),
+        "expires_in": AUTH_SESSION_TTL,
+        "access_token": token,
+        "token_type": "Bearer",
+        "portal_write_enabled": PORTAL_WRITE_ENABLED,
+    }
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    session = require_operator_session(
+        request,
+        allowed_roles={"operator", "admin"},
+    )
+    return {
+        "authenticated": True,
+        "username": session["username"],
+        "role": session["role"],
+        "expires_at": session["expires_at"],
+        "portal_write_enabled": PORTAL_WRITE_ENABLED,
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    session = require_operator_session(
+        request,
+        allowed_roles={"operator", "admin"},
+    )
+    revoke_auth_session(session, request)
+    return {"authenticated": False, "logged_out": True}
 
 
 @app.get("/api/health")
@@ -2340,6 +2708,9 @@ def health():
         "write_executor_enabled": WRITE_EXECUTOR_ENABLED,
         "write_executor_local_only": WRITE_EXECUTOR_LOCAL_ONLY,
         "write_token_configured": WRITE_TOKEN_FILE.exists(),
+        "operators_configured": bool(load_operators()) if OPERATORS_FILE.exists() else False,
+        "portal_write_enabled": PORTAL_WRITE_ENABLED,
+        "auth_session_ttl": AUTH_SESSION_TTL,
         "username_max_length": USERNAME_MAX_LENGTH,
         "python_compat": "3.6+",
         "cors_origins": CORS_ORIGINS,
