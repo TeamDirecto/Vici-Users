@@ -87,12 +87,12 @@
     <div id="groupChangeView" class="hidden">
       <section class="layout">
         <div class="card">
-          <div class="head"><div><h2>Cambio de User Group</h2><p>Compara el usuario contra el BASE_* del grupo destino.</p></div><span class="step">Preview</span></div>
+          <div class="head"><div><h2>Cambio de User Group</h2><p>Compara el usuario contra el BASE_* y migra su extensión al bloque destino.</p></div><span class="step">Preview + aplicar</span></div>
           <div class="body">
             <div class="field">
               <label>Usuario VICIdial</label>
               <input id="groupChangeUser" type="text" maxlength="20" placeholder="Ej. PJUANITO" autocomplete="off" />
-              <div class="hint">Para la validación usaremos PJUANITO. Esta etapa no realiza escrituras.</div>
+              <div class="hint">El usuario debe estar desconectado. La aplicación crea una nueva extensión y libera la anterior.</div>
             </div>
             <div class="field">
               <label>User Group destino</label>
@@ -112,7 +112,7 @@
         </div>
 
         <div class="card">
-          <div class="head"><div><h2>Resultado</h2><p>Comparación segura, sin modificar VICIdial.</p></div><span class="step">Sin escritura</span></div>
+          <div class="head"><div><h2>Resultado</h2><p>Comparación, validación y ejecución controlada sobre VICIdial.</p></div><span class="step">Migración</span></div>
           <div id="groupChangeEmpty" class="empty"><strong>Aún no hay cambio para revisar</strong><p>Indica usuario y grupo destino.</p></div>
           <div id="groupChangeResult" class="body hidden">
             <div id="groupChangeBlocker" class="conn-error hidden"></div>
@@ -133,7 +133,7 @@
             <div class="btns">
               <button class="btn success" id="groupChangeApplyBtn" disabled>Aplicar cambio</button>
             </div>
-            <div class="hint">Preview-only: el botón de aplicación permanecerá bloqueado hasta definir el tratamiento de la extensión anterior.</div>
+            <div class="hint" id="groupChangeApplyHint">Al aplicar se desactiva la extensión anterior, se elimina su alias, se marca FREE y se crea una extensión UNCREATED en el bloque destino.</div>
           </div>
         </div>
       </section>
@@ -162,8 +162,8 @@
 <div id="receiptOverlay" class="receipt-overlay hidden">
   <div class="receipt-card">
     <div class="receipt-head">
-      <h2>✓ Alta completada</h2>
-      <p>Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.</p>
+      <h2 id="receiptTitle">✓ Alta completada</h2>
+      <p id="receiptSubtitle">Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.</p>
     </div>
     <div class="receipt-body">
       <div class="credential-grid">
@@ -265,6 +265,8 @@
   let pendingOperationKey = null;
   let pendingProvisioning = null;
   let groupChangeGroupsLoaded = false;
+  let groupChangePreviewPayload = null;
+  let groupChangeOperationKey = null;
   let receiptCredentials = null;
   let receiptPasswordVisible = false;
   const AUTH_STORAGE_KEY = 'viciUsersAuthToken';
@@ -364,6 +366,8 @@
     pendingOperationKey=null;
     pendingProvisioning=null;
     groupChangeGroupsLoaded=false;
+    groupChangePreviewPayload=null;
+    groupChangeOperationKey=null;
     $('groupChangeTarget').innerHTML='<option>Inicia sesión para continuar</option>';
     $('groupChangeTarget').disabled=true;
     clearCredentialReceipt();
@@ -519,7 +523,13 @@
     $('toggleReceiptPassBtn').textContent=receiptPasswordVisible?'Ocultar':'Mostrar';
   }
 
-  function showCredentialReceipt(result){
+  function showCredentialReceipt(result,context='create'){
+    $('receiptTitle').textContent=context==='group-change'
+      ? '✓ Cambio de grupo completado'
+      : '✓ Alta completada';
+    $('receiptSubtitle').textContent=context==='group-change'
+      ? 'Nueva contraseña y extensión del grupo destino. La contraseña sólo se muestra en esta respuesta.'
+      : 'Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.';
     const credentials=result&&result.credentials_available&&result.credentials
       ? result.credentials
       : null;
@@ -647,7 +657,7 @@
       loadAudit();
     }else if(groupChange){
       $('pageTitle').textContent='Cambio de User Group';
-      $('pageSub').textContent='Preview de permisos y relación con la extensión administrada antes de modificar VICIdial.';
+      $('pageSub').textContent='Migra permisos, contraseña y extensión al User Group destino con liberación controlada de la extensión anterior.';
       loadGroupChangeGroups();
     }else{
       $('pageTitle').textContent='Alta masiva de usuarios';
@@ -662,7 +672,7 @@
     select.innerHTML='<option>Cargando…</option>';
     try{
       const data=await api('/groups');
-      const groups=(data.groups||[]).filter(g=>g.template_configured);
+      const groups=(data.groups||[]).filter(g=>g.template_configured&&g.provisioning_enabled);
       select.innerHTML='<option value="">Selecciona un User Group destino</option>'+
         groups.map(g=>'<option value="'+escapeHtml(g.user_group)+'">'+escapeHtml(g.user_group)+(g.group_name?' · '+escapeHtml(g.group_name):'')+'</option>').join('');
       select.disabled=false;
@@ -683,11 +693,11 @@
   }
 
   function friendlyGroupChangeWarning(code){
-    if(code.indexOf('MANAGED_EXTENSION_WOULD_REMAIN_IN_SOURCE_BLOCK:')===0){
-      return 'La extensión '+code.split(':')[1]+' pertenece al bloque del grupo actual. Un cambio sólo de permisos dejaría usuario y extensión en grupos distintos.';
+    if(code.indexOf('SOURCE_EXTENSION_WILL_BE_RELEASED:')===0){
+      return 'La extensión '+code.split(':')[1]+' será desactivada y marcada FREE al completar la migración.';
     }
     if(code.indexOf('MANAGED_EXTENSION_SOURCE_GROUP_MISMATCH:')===0){
-      return 'La extensión '+code.split(':')[1]+' ya presenta una desalineación con el grupo actual.';
+      return 'La extensión '+code.split(':')[1]+' presenta una desalineación con el grupo actual.';
     }
     return code;
   }
@@ -697,10 +707,16 @@
     const target=$('groupChangeTarget').value;
     if(!username||!target)return;
 
+    groupChangePreviewPayload=null;
+    groupChangeOperationKey=null;
+    $('groupChangeApplyBtn').disabled=true;
     $('groupChangePreviewBtn').disabled=true;
     $('groupChangePreviewBtn').textContent='Consultando…';
 
     try{
+      const me=await api('/auth/me');
+      showAuthenticated(me);
+
       const data=await api('/users/group-change/preview',{
         method:'POST',
         body:JSON.stringify({
@@ -708,6 +724,7 @@
           target_user_group:target
         })
       });
+      groupChangePreviewPayload=data;
 
       $('gcUser').textContent=data.username||'—';
       $('gcName').textContent=data.full_name||'—';
@@ -733,7 +750,7 @@
       const changed=(data.changed_permission_fields||[]);
       $('gcDetail').innerHTML='<strong>Diferencias de permisos respecto al BASE destino:</strong><br>'+
         (changed.length?escapeHtml(changed.join(', ')):'Ninguna')+
-        '<br><br><strong>Regla de migración:</strong> sólo se propone una extensión UNCREATED dentro del bloque destino; FREE no se reutiliza en esta etapa.';
+        '<br><br><strong>Regla de migración:</strong> se crea una extensión UNCREATED en el bloque destino; la extensión actual se desactiva, pierde su alias y queda FREE. FREE no se reutiliza automáticamente en esta etapa.';
 
       const blockers=data.blockers||[];
       $('groupChangeBlocker').textContent=blockers.length?'Bloqueado: '+blockers.join(', '):'';
@@ -745,14 +762,94 @@
 
       $('groupChangeEmpty').classList.add('hidden');
       $('groupChangeResult').classList.remove('hidden');
-      $('groupChangeApplyBtn').disabled=true;
 
-      toast('Preview de cambio de grupo completado. No se escribió nada.');
+      const canApply=Boolean(
+        data.execution_enabled &&
+        !blockers.length &&
+        authUser &&
+        authUser.role==='admin' &&
+        authUser.portal_write_enabled &&
+        (data.managed_extensions||[]).length===1 &&
+        targetAllocation
+      );
+      $('groupChangeApplyBtn').disabled=!canApply;
+      $('groupChangeApplyHint').textContent=canApply
+        ? 'Listo para aplicar. El usuario debe permanecer desconectado durante la migración.'
+        : (data.execution_note||'La migración todavía no cumple las condiciones de escritura.');
+
+      toast(canApply
+        ? 'Preview listo. El cambio puede aplicarse.'
+        : 'Preview completado; revisa bloqueos antes de aplicar.');
     }catch(error){
+      groupChangePreviewPayload=null;
+      $('groupChangeApplyBtn').disabled=true;
       toast(error.message);
     }finally{
       $('groupChangePreviewBtn').textContent='Previsualizar cambio';
       updateGroupChangePreviewButton();
+    }
+  }
+
+  async function applyGroupChange(){
+    const data=groupChangePreviewPayload;
+    if(!data||!data.execution_enabled||!authUser||authUser.role!=='admin'||!authUser.portal_write_enabled){
+      toast('Este cambio no está habilitado para ejecución.');
+      return;
+    }
+
+    const source=(data.managed_extensions||[])[0];
+    const target=data.target_extension_allocation||null;
+    if(!source||!target){
+      toast('La previsualización ya no contiene una migración válida.');
+      return;
+    }
+
+    const summary=data.username+' · '+data.current_user_group+' / '+source.extension+
+      ' → '+data.target_user_group+' / '+target.extension;
+    if(!window.confirm(
+      'Confirmar cambio de User Group:\n\n'+summary+
+      '\n\nLa extensión '+source.extension+' será desactivada y liberada.'
+    ))return;
+
+    if(!groupChangeOperationKey){
+      groupChangeOperationKey=makeIdempotencyKey().replace(/^PORTAL-/,'GC-');
+    }
+
+    $('groupChangeApplyBtn').disabled=true;
+    $('groupChangeApplyBtn').textContent='Aplicando…';
+    $('groupChangePreviewBtn').disabled=true;
+
+    try{
+      const result=await api('/users/group-change/execute',{
+        method:'POST',
+        body:JSON.stringify({
+          username:data.username,
+          target_user_group:data.target_user_group,
+          source_extension:String(source.extension),
+          target_extension:String(target.extension),
+          idempotency_key:groupChangeOperationKey
+        })
+      });
+
+      $('gcCurrentGroup').textContent=result.target_user_group||data.target_user_group;
+      $('gcExtension').textContent=String(result.source_extension||source.extension)+' · FREE';
+      $('gcTargetExtension').textContent=String(result.target_extension||target.extension)+' · IN_USE';
+      $('groupChangeApplyHint').textContent='SUCCESS: cambio aplicado. La sincronización Asterisk continuará automáticamente.';
+      $('groupChangeWarning').classList.add('hidden');
+      $('groupChangeBlocker').classList.add('hidden');
+
+      toast('Cambio completado: '+result.username+' → '+result.target_user_group+' / '+result.target_extension+'.');
+      showCredentialReceipt(result,'group-change');
+
+      groupChangePreviewPayload=null;
+      groupChangeOperationKey=null;
+    }catch(error){
+      toast('No se completó el cambio: '+error.message);
+      // Se conserva la misma key para que el reintento sea idempotente.
+      $('groupChangeApplyBtn').disabled=false;
+    }finally{
+      $('groupChangeApplyBtn').textContent='Aplicar cambio';
+      $('groupChangePreviewBtn').disabled=false;
     }
   }
 
@@ -827,7 +924,7 @@
   $('cancelCreateBtn').addEventListener('click',closeCreateConfirmation);
   $('confirmCreateBtn').addEventListener('click',executePortalProvisioning);
   $('navProvision').addEventListener('click',()=>showView('provision'));$('navGroupChange').addEventListener('click',()=>showView('group-change'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
-  $('groupChangeUser').addEventListener('input',updateGroupChangePreviewButton);$('groupChangeTarget').addEventListener('change',updateGroupChangePreviewButton);$('groupChangePreviewBtn').addEventListener('click',previewGroupChange);
+  $('groupChangeUser').addEventListener('input',updateGroupChangePreviewButton);$('groupChangeTarget').addEventListener('change',updateGroupChangePreviewButton);$('groupChangePreviewBtn').addEventListener('click',previewGroupChange);$('groupChangeApplyBtn').addEventListener('click',applyGroupChange);
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
   $('togglePass').addEventListener('click',()=>{const f=$('agentPass');const show=f.type==='password';f.type=show?'text':'password';$('togglePass').textContent=show?'Ocultar':'Mostrar'});
   $('demoBtn').addEventListener('click',()=>{$('bulkText').value='Juan Carlos,Pérez,López\nMaría Fernanda,Hernández,Ruiz\nKristian Michell,Maya,Guzmán\nJosé Luis,Hernández,Soto';toast('Ejemplo cargado. Selecciona un grupo con plantilla configurada.')});
