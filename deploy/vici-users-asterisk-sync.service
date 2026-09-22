@@ -1,6 +1,6 @@
 [Unit]
 Description=Vici-Users Asterisk Sync Worker
-After=network-online.target mariadb.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
