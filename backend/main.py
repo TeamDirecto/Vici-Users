@@ -126,7 +126,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.19.0-group-change")
+app = FastAPI(title="Vici-Users API", version="0.19.1-group-change-legacy-source")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2757,6 +2757,7 @@ class ProvisioningExecuteRequest(WritePlanRequest):
 class GroupChangePreviewRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=20)
     target_user_group: str = Field(..., min_length=1, max_length=20)
+    source_extension: Optional[str] = Field(None, min_length=1, max_length=20)
 
 
 class GroupChangeExecuteRequest(GroupChangePreviewRequest):
@@ -3034,12 +3035,160 @@ def group_users(user_group, request: Request):
         return {"user_group": user_group, "users": cursor.fetchall()}
 
 
+def validate_legacy_group_change_source_extension(
+    username,
+    current_group,
+    source_extension,
+):
+    """Validate a manually supplied source extension that predates Vici-Users inventory."""
+    extension = str(source_extension or "").strip()
+    blockers = []
+    warnings = []
+
+    if not extension:
+        blockers.append("SOURCE_EXTENSION_REQUIRED")
+        return None, blockers, warnings
+
+    ranges = load_extension_ranges()
+    extension_range = ranges.get(current_group)
+    if not extension_range:
+        blockers.append("SOURCE_GROUP_NOT_PROVISIONING_MANAGED")
+        return None, blockers, warnings
+
+    try:
+        extension_number = int(extension)
+    except (TypeError, ValueError):
+        blockers.append("SOURCE_EXTENSION_INVALID")
+        return None, blockers, warnings
+
+    if (
+        extension_number < int(extension_range["start"])
+        or extension_number > int(extension_range["end"])
+    ):
+        blockers.append("SOURCE_EXTENSION_OUTSIDE_CURRENT_GROUP_RANGE")
+        return None, blockers, warnings
+
+    ensure_inventory_db()
+    inventory_db = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    inventory_db.row_factory = sqlite3.Row
+    try:
+        tracked = inventory_db.execute(
+            """
+            SELECT extension, user_group, status, current_user
+              FROM extension_inventory
+             WHERE extension=?
+            """,
+            (extension,),
+        ).fetchone()
+    finally:
+        inventory_db.close()
+
+    if tracked:
+        if (
+            str(tracked["status"] or "").upper() == "IN_USE"
+            and str(tracked["current_user"] or "").upper() == username
+            and str(tracked["user_group"] or "") == current_group
+        ):
+            return dict(tracked), blockers, warnings
+        blockers.append(
+            "SOURCE_EXTENSION_ALREADY_MANAGED:%s"
+            % str(tracked["status"] or "UNKNOWN")
+        )
+        return None, blockers, warnings
+
+    topology = load_cluster_nodes()
+    enabled_servers = set(
+        node["server_ip"] for node in topology["nodes"] if node["enabled"]
+    )
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT extension, server_ip, login, dialplan_number,
+                   active, user_group
+              FROM phones
+             WHERE extension=%s
+             ORDER BY server_ip
+            """,
+            (extension,),
+        )
+        phone_rows = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT alias_id, alias_name, logins_list, user_group
+              FROM phones_alias
+             WHERE alias_id=%s
+             LIMIT 1
+            """,
+            (extension,),
+        )
+        alias_row = cursor.fetchone()
+
+    if not phone_rows:
+        blockers.append("SOURCE_EXTENSION_NOT_FOUND")
+        return None, blockers, warnings
+
+    if any(
+        str(row.get("user_group") or "") != current_group
+        for row in phone_rows
+    ):
+        blockers.append("SOURCE_EXTENSION_GROUP_MISMATCH")
+
+    servers = set(
+        str(row.get("server_ip") or "")
+        for row in phone_rows
+        if str(row.get("server_ip") or "")
+    )
+    missing_enabled = sorted(enabled_servers.difference(servers))
+    if missing_enabled:
+        blockers.append(
+            "SOURCE_EXTENSION_TOPOLOGY_INCOMPLETE:%s"
+            % ",".join(missing_enabled)
+        )
+
+    inactive_required = sorted(
+        str(row.get("server_ip") or "")
+        for row in phone_rows
+        if str(row.get("server_ip") or "") in enabled_servers
+        and str(row.get("active") or "").upper() != "Y"
+    )
+    if inactive_required:
+        blockers.append(
+            "SOURCE_EXTENSION_NOT_ACTIVE:%s"
+            % ",".join(inactive_required)
+        )
+
+    if not alias_row:
+        warnings.append("SOURCE_ALIAS_MISSING")
+    else:
+        warnings.append("SOURCE_ALIAS_WILL_BE_REMOVED:%s" % extension)
+
+    warnings.append(
+        "LEGACY_SOURCE_EXTENSION_MANUAL_CONFIRMATION_REQUIRED:%s" % extension
+    )
+
+    if blockers:
+        return None, blockers, warnings
+
+    return {
+        "extension": extension,
+        "user_group": current_group,
+        "status": "LEGACY",
+        "current_user": username,
+        "source": "LEGACY_DB_VALIDATED",
+        "server_count": len(servers),
+        "alias_present": bool(alias_row),
+    }, blockers, warnings
+
+
 @app.post("/api/users/group-change/preview")
 def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
     require_operator_session(request, allowed_roles={"admin"})
 
     username = payload.username.strip().upper()
     target_group = payload.target_user_group.strip()
+    requested_source_extension = str(payload.source_extension or "").strip()
 
     require_managed_group(target_group)
     require_provisioning_group(target_group)
@@ -3111,6 +3260,7 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
     )
 
     managed_extensions = []
+    source_extension_origin = None
     ensure_inventory_db()
     connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
     connection.row_factory = sqlite3.Row
@@ -3132,6 +3282,33 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
     blockers = []
     warnings = []
 
+    if len(managed_extensions) == 1:
+        source_extension_origin = "MANAGED_INVENTORY"
+        managed_extension = str(managed_extensions[0].get("extension") or "")
+        if (
+            requested_source_extension
+            and requested_source_extension != managed_extension
+        ):
+            blockers.append("SOURCE_EXTENSION_INPUT_MISMATCH")
+    elif len(managed_extensions) > 1:
+        blockers.append("MULTIPLE_MANAGED_EXTENSIONS_UNSUPPORTED")
+    else:
+        if requested_source_extension and current_group in load_extension_ranges():
+            legacy_source, legacy_blockers, legacy_warnings = (
+                validate_legacy_group_change_source_extension(
+                    username,
+                    current_group,
+                    requested_source_extension,
+                )
+            )
+            blockers.extend(legacy_blockers)
+            warnings.extend(legacy_warnings)
+            if legacy_source:
+                managed_extensions = [legacy_source]
+                source_extension_origin = "LEGACY_DB_VALIDATED"
+        else:
+            blockers.append("SOURCE_EXTENSION_REQUIRED")
+
     target_password_configured = target_group in load_group_defaults()
     if not target_password_configured:
         blockers.append("TARGET_DEFAULT_PASSWORD_NOT_CONFIGURED")
@@ -3150,11 +3327,6 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
 
     if current_group not in load_extension_ranges():
         blockers.append("SOURCE_GROUP_NOT_PROVISIONING_MANAGED")
-
-    if not managed_extensions:
-        blockers.append("MANAGED_SOURCE_EXTENSION_REQUIRED")
-    elif len(managed_extensions) > 1:
-        blockers.append("MULTIPLE_MANAGED_EXTENSIONS_UNSUPPORTED")
 
     for item in managed_extensions:
         extension = str(item.get("extension") or "")
@@ -3215,8 +3387,10 @@ def group_change_preview(payload: GroupChangePreviewRequest, request: Request):
         },
         "source_extension_policy": {
             "action": "DEACTIVATE_PHONES_DELETE_ALIAS_MARK_FREE",
-            "managed_extension_required": True,
+            "managed_extension_required": False,
+            "legacy_manual_source_supported": True,
         },
+        "source_extension_origin": source_extension_origin,
         "permission_fields_total": len(USER_CLONE_FIELDS),
         "permission_fields_changed": len(changed_permission_fields),
         "changed_permission_fields": changed_permission_fields,
@@ -3311,13 +3485,36 @@ def reserve_group_change_operation(payload, preview):
             """,
             (payload.source_extension,),
         ).fetchone()
-        if (
-            not source
-            or str(source["status"]).upper() != "IN_USE"
-            or str(source["current_user"] or "").upper()
-               != payload.username.strip().upper()
-            or str(source["user_group"]) != preview["current_user_group"]
-        ):
+        if source:
+            if (
+                str(source["status"]).upper() != "IN_USE"
+                or str(source["current_user"] or "").upper()
+                   != payload.username.strip().upper()
+                or str(source["user_group"]) != preview["current_user_group"]
+            ):
+                connection.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="SOURCE_EXTENSION_INVENTORY_CHANGED",
+                )
+        elif preview.get("source_extension_origin") == "LEGACY_DB_VALIDATED":
+            busy = connection.execute(
+                """
+                SELECT idempotency_key
+                  FROM group_change_operations
+                 WHERE source_extension=?
+                   AND status IN ('RESERVED','RUNNING')
+                 LIMIT 1
+                """,
+                (payload.source_extension.strip(),),
+            ).fetchone()
+            if busy:
+                connection.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="SOURCE_EXTENSION_GROUP_CHANGE_ALREADY_RUNNING",
+                )
+        else:
             connection.rollback()
             raise HTTPException(
                 status_code=409,
@@ -3470,8 +3667,36 @@ def finalize_group_change_inventory(payload, preview, result):
                 username,
             ),
         )
-        if source_cursor.rowcount != 1:
-            raise RuntimeError("SOURCE_EXTENSION_NOT_IN_USE")
+        if source_cursor.rowcount == 1:
+            source_old_status = "IN_USE"
+        else:
+            existing_source = connection.execute(
+                """
+                SELECT extension, user_group, status, current_user
+                  FROM extension_inventory
+                 WHERE extension=?
+                """,
+                (payload.source_extension.strip(),),
+            ).fetchone()
+            if existing_source:
+                raise RuntimeError("SOURCE_EXTENSION_INVENTORY_CONFLICT")
+            connection.execute(
+                """
+                INSERT INTO extension_inventory
+                    (extension, user_group, status, current_user,
+                     previous_user, released_at, updated_at, note)
+                VALUES (?, ?, 'FREE', NULL, ?, CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP, ?)
+                """,
+                (
+                    payload.source_extension.strip(),
+                    source_group,
+                    username,
+                    "Legacy extension adopted/released by group change %s"
+                    % payload.idempotency_key,
+                ),
+            )
+            source_old_status = "LEGACY"
 
         connection.execute(
             """
@@ -3492,11 +3717,12 @@ def finalize_group_change_inventory(payload, preview, result):
             INSERT INTO extension_inventory_events
                 (extension, user_group, event_type, old_status,
                  new_status, user_name, detail)
-            VALUES (?, ?, 'GROUP_CHANGE_RELEASE', 'IN_USE', 'FREE', ?, ?)
+            VALUES (?, ?, 'GROUP_CHANGE_RELEASE', ?, 'FREE', ?, ?)
             """,
             (
                 payload.source_extension.strip(),
                 source_group,
+                source_old_status,
                 username,
                 "idempotency_key=%s target_extension=%s"
                 % (payload.idempotency_key, payload.target_extension.strip()),
@@ -4125,6 +4351,7 @@ def group_change_execute_route(
         GroupChangePreviewRequest(
             username=payload.username,
             target_user_group=payload.target_user_group,
+            source_extension=payload.source_extension,
         ),
         request,
     )
