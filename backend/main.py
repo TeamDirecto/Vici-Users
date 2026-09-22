@@ -113,7 +113,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.15.2-local-write-gate")
+app = FastAPI(title="Vici-Users API", version="0.15.3-idempotent-replay")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1156,6 +1156,55 @@ def require_write_execution_gate(request):
         raise HTTPException(status_code=403, detail="Token de escritura inválido")
 
 
+def replay_provisioning_operation_if_known(payload):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        existing = connection.execute(
+            """
+            SELECT idempotency_key, user_group, username, full_name, extension,
+                   status, result_json
+              FROM provisioning_operations
+             WHERE idempotency_key=?
+            """,
+            (payload.idempotency_key,),
+        ).fetchone()
+
+        if not existing:
+            return None
+
+        same_payload = (
+            str(existing["user_group"]) == payload.user_group
+            and str(existing["username"]) == payload.username.upper()
+            and str(existing["full_name"]) == payload.full_name
+            and str(existing["extension"]) == payload.extension
+        )
+        if not same_payload:
+            raise HTTPException(
+                status_code=409,
+                detail="IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",
+            )
+
+        status = str(existing["status"] or "")
+        if status == "SUCCESS" and existing["result_json"]:
+            return json.loads(existing["result_json"])
+
+        raise HTTPException(
+            status_code=409,
+            detail="IDEMPOTENCY_KEY_ALREADY_USED:%s" % status,
+        )
+    except HTTPException:
+        raise
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="No fue posible consultar idempotencia: %s" % exc,
+        )
+    finally:
+        connection.close()
+
+
 def reserve_provisioning_operation(payload):
     ensure_inventory_db()
     connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
@@ -1563,6 +1612,10 @@ def compensate_provisioning(payload, inserted_phones, user_inserted):
 
 
 def execute_provisioning(payload):
+    replay = replay_provisioning_operation_if_known(payload)
+    if replay is not None:
+        return replay
+
     plan = provisioning_write_plan(
         payload.user_group,
         payload.username,
