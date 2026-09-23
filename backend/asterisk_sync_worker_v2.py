@@ -85,9 +85,63 @@ def process_wait_rebuild(sqlite_db, mysql_cursor, job):
         )
 
 
+def queue_shared_sip_reload(sqlite_db, mysql_cursor, jobs, eligible):
+    """Queue one sip reload per eligible node for all settled jobs in a batch."""
+    if not jobs:
+        return
+
+    manager_ids = []
+    stamp = datetime.utcnow().strftime("%H%M%S")
+    for index, server_ip in enumerate(eligible):
+        callerid = ("VUSRBT%s%02d" % (stamp, index))[:20]
+        mysql_cursor.execute(
+            """
+            INSERT INTO vicidial_manager
+                (entry_date, status, response, server_ip,
+                 action, callerid, cmd_line_b)
+            VALUES (NOW(), 'NEW', 'N', %s, 'Command', %s,
+                    'Command: sip reload')
+            """,
+            (server_ip, callerid),
+        )
+        manager_ids.append(int(mysql_cursor.lastrowid))
+
+    manager_json = json.dumps(manager_ids)
+    now = base.now_text()
+    job_ids = [int(item["id"]) for item in jobs]
+    placeholders = ",".join(["?"] * len(job_ids))
+    sqlite_db.execute(
+        """
+        UPDATE asterisk_sync_jobs
+           SET status='RELOAD_QUEUED', manager_ids_json=?,
+               reload_queued_at=?, updated_at=?, last_error=NULL
+         WHERE id IN (%s)
+           AND status='WAIT_SETTLE'
+        """ % placeholders,
+        tuple([manager_json, now, now] + job_ids),
+    )
+    sqlite_db.commit()
+    print(
+        "SIP_RELOAD shared jobs=%d extensions=%s manager_ids=%s"
+        % (
+            len(jobs),
+            ",".join(str(item["extension"]) for item in jobs),
+            ",".join(str(item) for item in manager_ids),
+        )
+    )
+
+
 def process_wait_settle(sqlite_db, mysql_cursor, job):
+    # The run loop works from a snapshot. A previous job may already have
+    # coalesced this row into one shared reload, so re-check durable state.
+    current = sqlite_db.execute(
+        "SELECT status FROM asterisk_sync_jobs WHERE id=?",
+        (job["id"],),
+    ).fetchone()
+    if not current or str(current["status"]) != "WAIT_SETTLE":
+        return
+
     eligible = json.loads(job["eligible_servers_json"] or "[]")
-    ineligible = json.loads(job["ineligible_servers_json"] or "[]")
     if not eligible:
         return
 
@@ -135,12 +189,38 @@ def process_wait_settle(sqlite_db, mysql_cursor, job):
     if datetime.utcnow() - started < timedelta(seconds=SETTLE_SECONDS):
         return
 
-    base.queue_sip_reload(
+    # Coalesce every ready job with the exact same eligible server set.
+    # This prevents a 20-user portal batch from generating 20 sip reloads
+    # per Asterisk node after the same configuration rebuild.
+    candidates = sqlite_db.execute(
+        """
+        SELECT *
+          FROM asterisk_sync_jobs
+         WHERE status='WAIT_SETTLE'
+           AND eligible_servers_json=?
+         ORDER BY id
+        """,
+        (job["eligible_servers_json"],),
+    ).fetchall()
+
+    ready = []
+    for item in candidates:
+        item_started = base.parse_ts(item["settle_started_at"])
+        if (
+            item_started
+            and datetime.utcnow() - item_started
+                >= timedelta(seconds=SETTLE_SECONDS)
+        ):
+            ready.append(item)
+
+    if not ready:
+        return
+
+    queue_shared_sip_reload(
         sqlite_db,
         mysql_cursor,
-        job,
+        ready,
         eligible,
-        ineligible,
     )
 
 
