@@ -78,7 +78,7 @@
         <div id="preview" class="hidden">
           <div class="toolbar"><strong id="previewSummary">0 registros</strong><span id="templateBadge" class="badge gray">Plantilla —</span></div>
           <div class="table-wrap"><table><thead><tr><th>Persona</th><th>Inicial</th><th>Username final</th><th>Extensión</th><th>Resultado</th><th>Intentos</th></tr></thead><tbody id="rows"></tbody></table></div>
-          <div class="footer"><small id="createNote">CP1 validado. Rangos cargados; escritura todavía deshabilitada.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuario + extensión</button></div></div>
+          <div class="footer"><small id="createNote">CP1 validado. Rangos cargados; escritura todavía deshabilitada.</small><div class="btns" style="margin:0"><button class="btn secondary" id="revalidateBtn">↻ Revalidar</button><button class="btn success" id="createBtn" disabled>Crear usuario(s) + extensión(es)</button></div></div>
         </div>
       </div>
     </section>
@@ -171,7 +171,7 @@
       <p id="receiptSubtitle">Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.</p>
     </div>
     <div class="receipt-body">
-      <div class="credential-grid">
+      <div id="singleCredentialGrid" class="credential-grid">
         <div class="credential-row">
           <span>Usuario</span>
           <strong id="receiptUsername">—</strong>
@@ -188,6 +188,13 @@
           <button id="copyPhoneBtn" class="mini-btn" type="button">Copiar</button>
         </div>
       </div>
+      <div id="batchCredentialBlock" class="receipt-note hidden">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px">
+          <strong>Credenciales del lote</strong>
+          <button id="toggleBatchPasswordsBtn" class="mini-btn" type="button">Mostrar passwords</button>
+        </div>
+        <div id="batchCredentialRows" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.7;white-space:pre-wrap;word-break:break-word"></div>
+      </div>
       <div class="receipt-note">
         La contraseña no se guarda en el navegador, journal ni auditoría. Al cerrar este comprobante o recargar la página dejará de estar disponible.
       </div>
@@ -203,7 +210,7 @@
   <div class="confirm-card">
     <div class="confirm-head">
       <h2>Confirmar alta en VICIdial</h2>
-      <p>La operación creará el usuario y sus phones en los nodos habilitados.</p>
+      <p>La operación creará uno o varios usuarios y sus phones en los nodos habilitados.</p>
     </div>
     <div class="confirm-body">
       <div id="confirmError" class="auth-error hidden"></div>
@@ -273,7 +280,10 @@
   let groupChangePreviewPayload = null;
   let groupChangeOperationKey = null;
   let receiptCredentials = null;
+  let receiptBatchCredentials = null;
   let receiptPasswordVisible = false;
+  let receiptBatchPasswordVisible = false;
+  const MAX_PORTAL_BATCH = 25;
   const AUTH_STORAGE_KEY = 'viciUsersAuthToken';
 
   const $ = id => document.getElementById(id);
@@ -385,13 +395,20 @@
     toast('Sesión cerrada.');
   }
 
-  function singleProvisioningCandidate(){
-    if(!previewPayload||!Array.isArray(previewPayload.users))return null;
-    if(previewPayload.requested!==1||previewPayload.available!==1||previewPayload.conflicts!==0)return null;
-    const user=previewPayload.users[0];
-    if(!user||user.status!=='AVAILABLE'||!user.username||!user.extension)return null;
-    if(user.extension_source==='FREE')return null;
-    return user;
+  function provisioningCandidates(){
+    if(!previewPayload||!Array.isArray(previewPayload.users))return [];
+    if(previewPayload.conflicts!==0)return [];
+    if(previewPayload.requested<1||previewPayload.requested>MAX_PORTAL_BATCH)return [];
+    if(previewPayload.available!==previewPayload.requested)return [];
+
+    const users=previewPayload.users.filter(user=>
+      user &&
+      user.status==='AVAILABLE' &&
+      user.username &&
+      user.extension &&
+      user.extension_source!=='FREE'
+    );
+    return users.length===previewPayload.requested?users:[];
   }
 
   function buildFullName(user){
@@ -408,8 +425,8 @@
   function updateCreateState(){
     const portalWrite=Boolean(authUser&&authUser.portal_write_enabled);
     const isAdmin=Boolean(authUser&&authUser.role==='admin');
-    const candidate=singleProvisioningCandidate();
-    const canCreate=Boolean(portalWrite&&isAdmin&&candidate);
+    const candidates=provisioningCandidates();
+    const canCreate=Boolean(portalWrite&&isAdmin&&candidates.length);
     $('createBtn').disabled=!canCreate;
 
     if(previewPayload){
@@ -418,12 +435,14 @@
         $('createNote').textContent='Preview: '+(alloc.allocated||0)+' extensión(es) asignada(s) · '+(alloc.required_nodes||0)+' nodo(s) requeridos · portal autenticado en modo sólo lectura.';
       }else if(!isAdmin){
         $('createNote').textContent='La escritura del portal está habilitada, pero esta sesión no tiene rol admin.';
-      }else if(previewPayload.requested!==1){
-        $('createNote').textContent='CP4 inicial permite una sola alta por operación. Previsualiza exactamente una persona para crear.';
-      }else if(candidate){
-        $('createNote').textContent='Alta lista para confirmación: 1 usuario + extensión · '+(alloc.required_nodes||0)+' nodo(s).';
-      }else if(previewPayload.users&&previewPayload.users[0]&&previewPayload.users[0].extension_source==='FREE'){
-        $('createNote').textContent='La extensión candidata es FREE. El reciclaje aún está bloqueado en el ejecutor v1.';
+      }else if(previewPayload.requested>MAX_PORTAL_BATCH){
+        $('createNote').textContent='Por seguridad el portal permite hasta '+MAX_PORTAL_BATCH+' altas por lote. Divide la solicitud y vuelve a previsualizar.';
+      }else if(previewPayload.conflicts!==0||previewPayload.available!==previewPayload.requested){
+        $('createNote').textContent='El lote contiene conflictos. Todas las filas deben quedar disponibles antes de crear.';
+      }else if(previewPayload.users&&previewPayload.users.some(u=>u.extension_source==='FREE')){
+        $('createNote').textContent='El lote contiene una extensión FREE. El reciclaje sigue bloqueado; usa únicamente UNCREATED.';
+      }else if(candidates.length){
+        $('createNote').textContent='Lote listo: '+candidates.length+' usuario(s) + extensión(es) · '+(alloc.required_nodes||0)+' nodo(s) por extensión.';
       }else{
         $('createNote').textContent='La previsualización no cumple las condiciones para escritura.';
       }
@@ -431,31 +450,39 @@
   }
 
   function openCreateConfirmation(){
-    const candidate=singleProvisioningCandidate();
-    if(!candidate||!authUser||authUser.role!=='admin'||!authUser.portal_write_enabled){
+    const candidates=provisioningCandidates();
+    if(!candidates.length||!authUser||authUser.role!=='admin'||!authUser.portal_write_enabled){
       toast('Esta previsualización todavía no puede escribirse.');
       updateCreateState();
       return;
     }
 
-    const fullName=buildFullName(candidate);
-    pendingProvisioning={
+    const requiredNodes=(previewPayload.extension_allocation||{}).required_nodes||0;
+    pendingProvisioning=candidates.map(user=>({
       user_group:$('userGroup').value,
-      username:candidate.username,
-      full_name:fullName,
-      extension:String(candidate.extension),
-      extension_source:candidate.extension_source||'UNCREATED',
-      required_nodes:(previewPayload.extension_allocation||{}).required_nodes||0
-    };
+      username:user.username,
+      full_name:buildFullName(user),
+      extension:String(user.extension),
+      extension_source:user.extension_source||'UNCREATED',
+      required_nodes:requiredNodes
+    }));
 
     if(!pendingOperationKey)pendingOperationKey=makeIdempotencyKey();
 
-    $('confirmUsername').textContent=pendingProvisioning.username;
-    $('confirmExtension').textContent=pendingProvisioning.extension;
-    $('confirmGroup').textContent=pendingProvisioning.user_group;
-    $('confirmFullName').textContent=pendingProvisioning.full_name;
-    $('confirmNodes').textContent=String(pendingProvisioning.required_nodes);
-    $('confirmSource').textContent=pendingProvisioning.extension_source==='FREE'?'Reciclada':'Nueva / UNCREATED';
+    const first=pendingProvisioning[0];
+    const last=pendingProvisioning[pendingProvisioning.length-1];
+    $('confirmUsername').textContent=pendingProvisioning.length===1
+      ? first.username
+      : pendingProvisioning.length+' usuarios';
+    $('confirmExtension').textContent=pendingProvisioning.length===1
+      ? first.extension
+      : first.extension+' → '+last.extension;
+    $('confirmGroup').textContent=first.user_group;
+    $('confirmFullName').textContent=pendingProvisioning.length===1
+      ? first.full_name
+      : 'Lote de '+pendingProvisioning.length+' altas';
+    $('confirmNodes').textContent=String(requiredNodes);
+    $('confirmSource').textContent='UNCREATED';
     $('confirmPhrase').value='';
     $('confirmCreateBtn').disabled=true;
     $('confirmError').classList.add('hidden');
@@ -464,51 +491,89 @@
   }
 
   function closeCreateConfirmation(){
-    if($('confirmCreateBtn').disabled===false&&$('confirmCreateBtn').textContent==='Creando…')return;
+    if($('confirmCreateBtn').disabled===true&&$('confirmCreateBtn').textContent.indexOf('Creando')===0)return;
     $('confirmOverlay').classList.add('hidden');
     $('confirmPhrase').value='';
     $('confirmError').classList.add('hidden');
   }
 
   async function executePortalProvisioning(){
-    if(!pendingProvisioning||$('confirmPhrase').value.trim()!=='CREAR')return;
+    if(!Array.isArray(pendingProvisioning)||!pendingProvisioning.length||$('confirmPhrase').value.trim()!=='CREAR')return;
 
     $('confirmCreateBtn').disabled=true;
     $('cancelCreateBtn').disabled=true;
-    $('confirmCreateBtn').textContent='Creando…';
     $('confirmError').classList.add('hidden');
 
-    const payload={
-      ...pendingProvisioning,
-      idempotency_key:pendingOperationKey
-    };
     const override=$('agentPass').value;
-    if(override)payload.agent_pass=override;
+    const results=[];
+    let failed=null;
 
     try{
-      const result=await api('/provisioning/portal-execute',{
-        method:'POST',
-        body:JSON.stringify(payload)
-      });
+      for(let index=0;index<pendingProvisioning.length;index++){
+        const item=pendingProvisioning[index];
+        $('confirmCreateBtn').textContent='Creando '+(index+1)+'/'+pendingProvisioning.length+'…';
 
-      $('confirmOverlay').classList.add('hidden');
+        const payload={
+          ...item,
+          idempotency_key:pendingOperationKey+'-'+String(index+1)
+        };
+        if(override)payload.agent_pass=override;
+
+        try{
+          const result=await api('/provisioning/portal-execute',{
+            method:'POST',
+            body:JSON.stringify(payload)
+          });
+          results.push(result);
+        }catch(error){
+          failed={index:index,item:item,error:error};
+          break;
+        }
+      }
+
       $('agentPass').value='';
       $('createBtn').disabled=true;
-      $('createNote').textContent='SUCCESS: '+result.username+' + '+result.extension+' · '+result.required_nodes+' nodo(s) · operador '+(result.requested_by||authUser.username)+'.';
-      toast('Alta completada: '+result.username+' / '+result.extension+'.');
 
-      showCredentialReceipt(result);
+      if(failed){
+        $('confirmOverlay').classList.add('hidden');
+        $('createNote').textContent='Lote parcial: '+results.length+' creado(s) de '+pendingProvisioning.length+'. Revalida los restantes.';
+        toast('Lote parcial: '+results.length+' alta(s) completada(s); falló '+failed.item.username+'.');
+
+        if(results.length){
+          showBatchCredentialReceipt(
+            results,
+            'Lote parcial. Falló '+failed.item.username+': '+failed.error.message
+          );
+        }else{
+          $('confirmError').textContent='No se completó ninguna alta: '+failed.error.message;
+          $('confirmError').classList.remove('hidden');
+          $('confirmOverlay').classList.remove('hidden');
+        }
+
+        // Los éxitos ya son definitivos e idempotentes. Un nuevo preview
+        // calculará únicamente las extensiones que aún siguen disponibles.
+        previewPayload=null;
+        pendingOperationKey=null;
+        pendingProvisioning=null;
+        await loadTemplate();
+        return;
+      }
+
+      $('confirmOverlay').classList.add('hidden');
+      $('createNote').textContent='SUCCESS: '+results.length+' usuario(s) + extensión(es) · operador '+(authUser.username||'—')+'.';
+      toast('Lote completado: '+results.length+' alta(s).');
+
+      if(results.length===1){
+        showCredentialReceipt(results[0]);
+      }else{
+        showBatchCredentialReceipt(results);
+      }
 
       previewPayload=null;
       pendingOperationKey=null;
       pendingProvisioning=null;
 
       await loadTemplate();
-    }catch(error){
-      $('confirmError').textContent=error.message;
-      $('confirmError').classList.remove('hidden');
-      toast('No se completó el alta: '+error.message);
-      // Se conserva pendingOperationKey para que un reintento sea idempotente.
     }finally{
       $('cancelCreateBtn').disabled=false;
       $('confirmCreateBtn').textContent='Crear ahora';
@@ -529,6 +594,18 @@
     $('toggleReceiptPassBtn').textContent=receiptPasswordVisible?'Ocultar':'Mostrar';
   }
 
+  function renderBatchCredentials(){
+    if(!Array.isArray(receiptBatchCredentials))return;
+    $('batchCredentialRows').textContent=receiptBatchCredentials.map(item=>
+      item.username+' | '+
+      (receiptBatchPasswordVisible?item.password:'••••••••')+
+      ' | '+item.phone
+    ).join('\n');
+    $('toggleBatchPasswordsBtn').textContent=receiptBatchPasswordVisible
+      ? 'Ocultar passwords'
+      : 'Mostrar passwords';
+  }
+
   function showCredentialReceipt(result,context='create'){
     $('receiptTitle').textContent=context==='group-change'
       ? '✓ Cambio de grupo completado'
@@ -536,6 +613,12 @@
     $('receiptSubtitle').textContent=context==='group-change'
       ? 'Nueva contraseña y extensión del grupo destino. La contraseña sólo se muestra en esta respuesta.'
       : 'Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.';
+
+    receiptBatchCredentials=null;
+    receiptBatchPasswordVisible=false;
+    $('batchCredentialBlock').classList.add('hidden');
+    $('singleCredentialGrid').classList.remove('hidden');
+
     const credentials=result&&result.credentials_available&&result.credentials
       ? result.credentials
       : null;
@@ -557,12 +640,42 @@
     $('receiptOverlay').classList.remove('hidden');
   }
 
-  function clearCredentialReceipt(){
+  function showBatchCredentialReceipt(results,notice=''){
     receiptCredentials=null;
     receiptPasswordVisible=false;
+    receiptBatchPasswordVisible=false;
+    receiptBatchCredentials=(results||[]).map(result=>{
+      const credentials=result&&result.credentials_available&&result.credentials
+        ? result.credentials
+        : {};
+      return {
+        username:String(credentials.username||result.username||''),
+        password:String(credentials.password||''),
+        phone:String(credentials.phone||result.extension||'')
+      };
+    });
+
+    $('receiptTitle').textContent=notice?'⚠ Alta parcial':'✓ Lote completado';
+    $('receiptSubtitle').textContent=notice
+      ? notice
+      : receiptBatchCredentials.length+' usuarios creados. Las contraseñas sólo se muestran en esta respuesta.';
+    $('singleCredentialGrid').classList.add('hidden');
+    $('batchCredentialBlock').classList.remove('hidden');
+    renderBatchCredentials();
+    $('receiptOverlay').classList.remove('hidden');
+  }
+
+  function clearCredentialReceipt(){
+    receiptCredentials=null;
+    receiptBatchCredentials=null;
+    receiptPasswordVisible=false;
+    receiptBatchPasswordVisible=false;
     $('receiptUsername').textContent='—';
     $('receiptPassword').textContent='••••••••';
     $('receiptPhone').textContent='—';
+    $('batchCredentialRows').textContent='';
+    $('batchCredentialBlock').classList.add('hidden');
+    $('singleCredentialGrid').classList.remove('hidden');
     $('receiptOverlay').classList.add('hidden');
   }
 
@@ -582,7 +695,26 @@
     renderReceiptPassword();
   }
 
+  function toggleBatchPasswords(){
+    if(!Array.isArray(receiptBatchCredentials)||!receiptBatchCredentials.length)return;
+    receiptBatchPasswordVisible=!receiptBatchPasswordVisible;
+    renderBatchCredentials();
+  }
+
   function copyReceiptCredentials(){
+    if(Array.isArray(receiptBatchCredentials)&&receiptBatchCredentials.length){
+      const missing=receiptBatchCredentials.some(item=>!item.password);
+      if(missing){
+        toast('Alguna contraseña ya no está disponible.');
+        return;
+      }
+      copyText(
+        receiptBatchCredentials.map(item=>item.username+' | '+item.password+' | '+item.phone).join('\n'),
+        'Credenciales del lote'
+      );
+      return;
+    }
+
     if(!receiptCredentials||!receiptCredentials.password){
       toast('La contraseña ya no está disponible.');
       return;
@@ -948,7 +1080,7 @@
   }
 
   $('loginForm').addEventListener('submit',login);$('logoutBtn').addEventListener('click',logout);
-  $('toggleReceiptPassBtn').addEventListener('click',toggleReceiptPassword);
+  $('toggleReceiptPassBtn').addEventListener('click',toggleReceiptPassword);$('toggleBatchPasswordsBtn').addEventListener('click',toggleBatchPasswords);
   $('copyUserBtn').addEventListener('click',()=>copyText(receiptCredentials&&receiptCredentials.username,'Usuario'));
   $('copyPhoneBtn').addEventListener('click',()=>copyText(receiptCredentials&&receiptCredentials.phone,'Phone'));
   $('copyCredentialsBtn').addEventListener('click',copyReceiptCredentials);
