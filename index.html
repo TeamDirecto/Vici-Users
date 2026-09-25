@@ -19,7 +19,7 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand"><div class="mark">VU</div><div><strong>Vici-Users</strong><small>Provisioning Console</small></div></div>
-    <div><div class="nav-title">EHECTO</div><button class="nav active" id="navProvision" type="button">＋ Alta de usuarios</button><button class="nav" id="navGroupChange" type="button">⇄ Cambio de User Group</button><button class="nav" id="navAudit" type="button">♻ Auditoría de extensiones</button></div>
+    <div><div class="nav-title">EHECTO</div><button class="nav active" id="navProvision" type="button">＋ Alta de usuarios</button><button class="nav" id="navSupervisors" type="button">★ Alta de supervisores</button><button class="nav" id="navGroupChange" type="button">⇄ Cambio de User Group</button><button class="nav" id="navAudit" type="button">♻ Auditoría de extensiones</button></div>
     <div class="server"><div><span id="serverDot" class="dot"></span><strong>vici97</strong></div><p id="serverText">Comprobando API en vici97 y base vici222…</p></div>
   </aside>
 
@@ -82,6 +82,70 @@
         </div>
       </div>
     </section>
+    </div>
+
+    <div id="supervisorView" class="hidden">
+      <section class="layout">
+        <div class="card">
+          <div class="head"><div><h2>Alta de supervisor</h2><p>Supervisor nivel 8 basado en ADMINSANT02.</p></div><span class="step">Nodo .90</span></div>
+          <div class="body">
+            <div class="field">
+              <label>Username</label>
+              <input id="supervisorUser" type="text" maxlength="20" placeholder="Ej. JSUPERVISOR" autocomplete="off" />
+              <div class="hint">Se guardará en mayúsculas. Debe ser único en VICIdial.</div>
+            </div>
+            <div class="field">
+              <label>Nombre completo</label>
+              <input id="supervisorName" type="text" maxlength="50" placeholder="Ej. JUAN PEREZ LOPEZ" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label>User Group</label>
+              <select id="supervisorGroup" disabled><option>Selecciona primero esta vista…</option></select>
+              <div class="hint">El supervisor heredará permisos de ADMINSANT02 y se asignará al User Group elegido.</div>
+            </div>
+            <div class="rule">
+              <strong>Política de supervisor</strong><br>
+              User level: <code>8</code><br>
+              Plantilla genérica: <code>ADMINSANT02</code><br>
+              Nodo único: <code>172.20.21.90</code><br>
+              Extensiones: desde <code>1064</code>, tomando la siguiente disponible.<br>
+              Password: 12 caracteres aleatorios, sólo letras mayúsculas/minúsculas y números.
+            </div>
+            <div class="btns">
+              <button class="btn primary" id="supervisorPreviewBtn" disabled>Previsualizar supervisor</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="head"><div><h2>Previsualización</h2><p>Valida usuario, extensión, plantilla y phone antes de escribir.</p></div><span class="step">Nivel 8</span></div>
+          <div id="supervisorEmpty" class="empty"><strong>Aún no hay supervisor para revisar</strong><p>Captura username, nombre y User Group.</p></div>
+          <div id="supervisorResult" class="body hidden">
+            <div id="supervisorBlocker" class="conn-error hidden"></div>
+            <div class="template">
+              <div><span>Usuario</span><strong id="supUser">—</strong></div>
+              <div><span>Nombre</span><strong id="supName">—</strong></div>
+              <div><span>User Group</span><strong id="supGroup">—</strong></div>
+              <div><span>User level</span><strong id="supLevel">8</strong></div>
+              <div><span>Extensión</span><strong id="supExtension">—</strong></div>
+              <div><span>Nodo</span><strong id="supNode">172.20.21.90</strong></div>
+              <div><span>Phone Login agente</span><strong id="supPhoneLogin">—</strong></div>
+              <div><span>Phone Pass agente</span><strong id="supPhonePass">—</strong></div>
+              <div><span>Login phone en nodo</span><strong id="supRecordLogin">—</strong></div>
+              <div><span>Dialplan</span><strong id="supDialplan">—</strong></div>
+              <div><span>Plantilla</span><strong id="supTemplate">ADMINSANT02</strong></div>
+              <div><span>Password</span><strong id="supPasswordPolicy">12 alfanumérico aleatorio</strong></div>
+            </div>
+            <div class="rule">
+              <strong>Importante:</strong> los campos <code>phone_login</code> y <code>phone_pass</code> del supervisor se asignarán automáticamente con la misma extensión generada.
+            </div>
+            <div class="btns">
+              <button class="btn success" id="supervisorCreateBtn" disabled>Crear supervisor</button>
+            </div>
+            <div class="hint" id="supervisorCreateHint">La contraseña se genera únicamente al ejecutar y se muestra una sola vez.</div>
+          </div>
+        </div>
+      </section>
     </div>
 
     <div id="groupChangeView" class="hidden">
@@ -279,6 +343,9 @@
   let groupChangeGroupsLoaded = false;
   let groupChangePreviewPayload = null;
   let groupChangeOperationKey = null;
+  let supervisorGroupsLoaded = false;
+  let supervisorPreviewPayload = null;
+  let supervisorOperationKey = null;
   let receiptCredentials = null;
   let receiptBatchCredentials = null;
   let receiptPasswordVisible = false;
@@ -383,9 +450,14 @@
     groupChangeGroupsLoaded=false;
     groupChangePreviewPayload=null;
     groupChangeOperationKey=null;
+    supervisorGroupsLoaded=false;
+    supervisorPreviewPayload=null;
+    supervisorOperationKey=null;
     $('groupChangeTarget').innerHTML='<option>Inicia sesión para continuar</option>';
     $('groupChangeTarget').disabled=true;
     $('groupChangeSourceExtension').value='';
+    $('supervisorGroup').innerHTML='<option>Inicia sesión para continuar</option>';
+    $('supervisorGroup').disabled=true;
     clearCredentialReceipt();
     $('userGroup').innerHTML='<option value="">Inicia sesión para continuar</option>';
     $('userGroup').disabled=true;
@@ -609,10 +681,12 @@
   function showCredentialReceipt(result,context='create'){
     $('receiptTitle').textContent=context==='group-change'
       ? '✓ Cambio de grupo completado'
-      : '✓ Alta completada';
+      : (context==='supervisor'?'✓ Supervisor creado':'✓ Alta completada');
     $('receiptSubtitle').textContent=context==='group-change'
       ? 'Nueva contraseña y extensión del grupo destino. La contraseña sólo se muestra en esta respuesta.'
-      : 'Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.';
+      : (context==='supervisor'
+          ? 'Password aleatorio de 12 caracteres y extensión asignada. La contraseña sólo se muestra en esta respuesta.'
+          : 'Credenciales generadas para el agente. Esta contraseña sólo se muestra en esta respuesta.');
 
     receiptBatchCredentials=null;
     receiptBatchPasswordVisible=false;
@@ -779,13 +853,16 @@
   function showView(view){
     const audit=view==='audit';
     const groupChange=view==='group-change';
-    const provision=!audit&&!groupChange;
+    const supervisors=view==='supervisors';
+    const provision=!audit&&!groupChange&&!supervisors;
 
     $('provisionView').classList.toggle('hidden',!provision);
+    $('supervisorView').classList.toggle('hidden',!supervisors);
     $('groupChangeView').classList.toggle('hidden',!groupChange);
     $('auditView').classList.toggle('hidden',!audit);
 
     $('navProvision').classList.toggle('active',provision);
+    $('navSupervisors').classList.toggle('active',supervisors);
     $('navGroupChange').classList.toggle('active',groupChange);
     $('navAudit').classList.toggle('active',audit);
 
@@ -797,9 +874,151 @@
       $('pageTitle').textContent='Cambio de User Group';
       $('pageSub').textContent='Migra permisos, contraseña y extensión al User Group destino con liberación controlada de la extensión anterior.';
       loadGroupChangeGroups();
+    }else if(supervisors){
+      $('pageTitle').textContent='Alta de supervisores';
+      $('pageSub').textContent='Crea supervisores nivel 8 desde ADMINSANT02 con extensión exclusiva en el nodo 172.20.21.90.';
+      loadSupervisorGroups();
     }else{
       $('pageTitle').textContent='Alta masiva de usuarios';
       $('pageSub').textContent='Alta de usuario + extensión: cada User Group utiliza un BASE_* y una contraseña default protegidos en vici97.';
+    }
+  }
+
+  async function loadSupervisorGroups(){
+    if(supervisorGroupsLoaded)return;
+    const select=$('supervisorGroup');
+    select.disabled=true;
+    select.innerHTML='<option>Cargando…</option>';
+    try{
+      const data=await api('/groups');
+      const groups=data.groups||[];
+      select.innerHTML='<option value="">Selecciona un User Group</option>'+
+        groups.map(g=>'<option value="'+escapeHtml(g.user_group)+'">'+escapeHtml(g.user_group)+(g.group_name?' · '+escapeHtml(g.group_name):'')+'</option>').join('');
+      select.disabled=false;
+      supervisorGroupsLoaded=true;
+      updateSupervisorPreviewButton();
+    }catch(error){
+      select.innerHTML='<option>No disponible</option>';
+      toast(error.message);
+    }
+  }
+
+  function updateSupervisorPreviewButton(){
+    const ready=Boolean(
+      $('supervisorUser').value.trim() &&
+      $('supervisorName').value.trim() &&
+      $('supervisorGroup').value
+    );
+    $('supervisorPreviewBtn').disabled=!ready;
+  }
+
+  async function previewSupervisor(){
+    const username=$('supervisorUser').value.trim().toUpperCase();
+    const fullName=$('supervisorName').value.trim();
+    const userGroup=$('supervisorGroup').value;
+    if(!username||!fullName||!userGroup)return;
+
+    supervisorPreviewPayload=null;
+    supervisorOperationKey=null;
+    $('supervisorCreateBtn').disabled=true;
+    $('supervisorPreviewBtn').disabled=true;
+    $('supervisorPreviewBtn').textContent='Validando…';
+
+    try{
+      const data=await api('/supervisors/preview',{
+        method:'POST',
+        body:JSON.stringify({
+          username:username,
+          full_name:fullName,
+          user_group:userGroup
+        })
+      });
+      supervisorPreviewPayload=data;
+
+      $('supUser').textContent=data.username||'—';
+      $('supName').textContent=data.full_name||'—';
+      $('supGroup').textContent=data.user_group||'—';
+      $('supLevel').textContent=String(data.user_level||8);
+      $('supExtension').textContent=data.extension||'—';
+      $('supNode').textContent=data.server_ip||'—';
+      $('supPhoneLogin').textContent=data.phone_login||'—';
+      $('supPhonePass').textContent=data.phone_pass||'—';
+      $('supRecordLogin').textContent=data.phone_record_login||'—';
+      $('supDialplan').textContent=data.dialplan_number||'—';
+      $('supTemplate').textContent=data.template_user||'—';
+      $('supPasswordPolicy').textContent='12 alfanumérico aleatorio';
+
+      const blockers=data.blockers||[];
+      $('supervisorBlocker').textContent=blockers.length?'Bloqueado: '+blockers.join(' · '):'';
+      $('supervisorBlocker').classList.toggle('hidden',!blockers.length);
+      $('supervisorEmpty').classList.add('hidden');
+      $('supervisorResult').classList.remove('hidden');
+
+      const canCreate=Boolean(
+        data.execution_enabled &&
+        !blockers.length &&
+        authUser &&
+        authUser.role==='admin' &&
+        authUser.portal_write_enabled
+      );
+      $('supervisorCreateBtn').disabled=!canCreate;
+      $('supervisorCreateHint').textContent=canCreate
+        ? 'Listo: al crear se generará el password aleatorio y se mostrará una sola vez.'
+        : 'La ejecución requiere sesión admin, portal write habilitado y preview sin bloqueos.';
+      toast(canCreate?'Supervisor listo para crear.':'Preview completado con bloqueos.');
+    }catch(error){
+      supervisorPreviewPayload=null;
+      $('supervisorCreateBtn').disabled=true;
+      toast(error.message);
+    }finally{
+      $('supervisorPreviewBtn').textContent='Previsualizar supervisor';
+      updateSupervisorPreviewButton();
+    }
+  }
+
+  async function createSupervisor(){
+    const data=supervisorPreviewPayload;
+    if(!data||!data.execution_enabled||!authUser||authUser.role!=='admin'||!authUser.portal_write_enabled){
+      toast('Este supervisor no está listo para creación.');
+      return;
+    }
+
+    if(!window.confirm(
+      'Crear supervisor nivel 8?\n\n'+
+      data.username+' · '+data.user_group+'\n'+
+      'Extensión '+data.extension+' · nodo '+data.server_ip
+    ))return;
+
+    if(!supervisorOperationKey){
+      supervisorOperationKey=makeIdempotencyKey().replace(/^PORTAL-/,'SUP-');
+    }
+
+    $('supervisorCreateBtn').disabled=true;
+    $('supervisorCreateBtn').textContent='Creando…';
+
+    try{
+      const result=await api('/supervisors/execute',{
+        method:'POST',
+        body:JSON.stringify({
+          username:data.username,
+          full_name:data.full_name,
+          user_group:data.user_group,
+          extension:String(data.extension),
+          idempotency_key:supervisorOperationKey
+        })
+      });
+
+      $('supervisorCreateHint').textContent='SUCCESS: supervisor '+result.username+' creado con extensión '+result.extension+'. Sincronización Asterisk en proceso.';
+      toast('Supervisor creado: '+result.username+' / '+result.extension+'.');
+      showCredentialReceipt(result,'supervisor');
+
+      supervisorPreviewPayload=null;
+      supervisorOperationKey=null;
+    }catch(error){
+      toast('No se completó el alta: '+error.message);
+      $('supervisorCreateBtn').disabled=false;
+    }finally{
+      $('supervisorCreateBtn').textContent='Crear supervisor';
     }
   }
 
@@ -1088,7 +1307,8 @@
   $('confirmPhrase').addEventListener('input',()=>{$('confirmCreateBtn').disabled=$('confirmPhrase').value.trim()!=='CREAR'});
   $('cancelCreateBtn').addEventListener('click',closeCreateConfirmation);
   $('confirmCreateBtn').addEventListener('click',executePortalProvisioning);
-  $('navProvision').addEventListener('click',()=>showView('provision'));$('navGroupChange').addEventListener('click',()=>showView('group-change'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
+  $('navProvision').addEventListener('click',()=>showView('provision'));$('navSupervisors').addEventListener('click',()=>showView('supervisors'));$('navGroupChange').addEventListener('click',()=>showView('group-change'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
+  $('supervisorUser').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorName').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorGroup').addEventListener('change',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorPreviewBtn').addEventListener('click',previewSupervisor);$('supervisorCreateBtn').addEventListener('click',createSupervisor);
   $('groupChangeUser').addEventListener('input',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true;updateGroupChangePreviewButton()});$('groupChangeSourceExtension').addEventListener('input',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true});$('groupChangeTarget').addEventListener('change',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true;updateGroupChangePreviewButton()});$('groupChangePreviewBtn').addEventListener('click',previewGroupChange);$('groupChangeApplyBtn').addEventListener('click',applyGroupChange);
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
   $('togglePass').addEventListener('click',()=>{const f=$('agentPass');const show=f.type==='password';f.type=show?'text':'password';$('togglePass').textContent=show?'Ocultar':'Mostrar'});
