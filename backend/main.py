@@ -132,7 +132,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.20.1-supervisor-auto-userid")
+app = FastAPI(title="Vici-Users API", version="0.20.2-supervisor-template-split")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -4609,10 +4609,13 @@ def next_supervisor_extension():
     )
 
 
-def supervisor_template_and_phone(cursor):
+def supervisor_template_and_phone(cursor, user_group):
+    # ADMINSANT02 is the generic vicidial_users permission template.
+    # Its phone_login/phone_pass are intentionally NOT required: the phone
+    # technical template is selected independently from node .90 inside the
+    # target User Group.
     template_fields = [
         "user", "full_name", "user_level", "user_group", "active",
-        "phone_login", "phone_pass",
     ] + list(USER_CLONE_FIELDS)
     select_sql = ", ".join("`%s`" % field for field in template_fields)
     cursor.execute(
@@ -4636,64 +4639,24 @@ def supervisor_template_and_phone(cursor):
             detail="SUPERVISOR_TEMPLATE_NOT_ACTIVE",
         )
 
-    source_phone_login = str(template.get("phone_login") or "").strip()
-    if not source_phone_login:
-        raise HTTPException(
-            status_code=409,
-            detail="SUPERVISOR_TEMPLATE_PHONE_LOGIN_MISSING",
-        )
-
-    candidate_logins = [source_phone_login]
     cursor.execute(
         """
-        SELECT logins_list
-          FROM phones_alias
-         WHERE alias_id=%s
+        SELECT *
+          FROM phones
+         WHERE server_ip=%s
+           AND user_group=%s
+           AND active='Y'
+         ORDER BY extension
          LIMIT 1
         """,
-        (source_phone_login,),
+        (SUPERVISOR_SERVER_IP, user_group),
     )
-    alias_row = cursor.fetchone()
-    if alias_row and alias_row.get("logins_list"):
-        candidate_logins = [
-            item.strip()
-            for item in str(alias_row["logins_list"]).split(",")
-            if item.strip()
-        ]
-
-    phone = None
-    if candidate_logins:
-        placeholders = ",".join(["%s"] * len(candidate_logins))
-        cursor.execute(
-            """
-            SELECT *
-              FROM phones
-             WHERE server_ip=%s
-               AND login IN (%s)
-             ORDER BY extension
-             LIMIT 1
-            """ % ("%s", placeholders),
-            tuple([SUPERVISOR_SERVER_IP] + candidate_logins),
-        )
-        phone = cursor.fetchone()
-
-    if not phone:
-        cursor.execute(
-            """
-            SELECT *
-              FROM phones
-             WHERE server_ip=%s
-               AND extension=%s
-             LIMIT 1
-            """,
-            (SUPERVISOR_SERVER_IP, source_phone_login),
-        )
-        phone = cursor.fetchone()
+    phone = cursor.fetchone()
 
     if not phone:
         raise HTTPException(
             status_code=409,
-            detail="SUPERVISOR_TEMPLATE_PHONE_MISSING_ON_NODE_90",
+            detail="SUPERVISOR_PHONE_TEMPLATE_MISSING_FOR_GROUP_ON_NODE_90",
         )
 
     if not phone.get("template_id") or not phone.get("conf_secret"):
@@ -4703,6 +4666,7 @@ def supervisor_template_and_phone(cursor):
         )
 
     return template, phone
+
 
 
 def supervisor_write_plan(username, full_name, user_group, extension):
@@ -4770,7 +4734,10 @@ def supervisor_write_plan(username, full_name, user_group, extension):
         if not required_user_fields.issubset(user_schema):
             blockers.append("SUPERVISOR_USER_SCHEMA_MISMATCH")
 
-        template, source_phone = supervisor_template_and_phone(cursor)
+        template, source_phone = supervisor_template_and_phone(
+            cursor,
+            user_group,
+        )
 
         cursor.execute("SHOW COLUMNS FROM phones")
         phone_columns = [row["Field"] for row in cursor.fetchall()]
