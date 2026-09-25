@@ -132,7 +132,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.20.0-supervisors")
+app = FastAPI(title="Vici-Users API", version="0.20.1-supervisor-auto-userid")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2712,6 +2712,78 @@ def candidate_for(last_name, name, prefix_len):
     return raw[:USERNAME_MAX_LENGTH]
 
 
+def resolve_person_username(first_names, paternal, existing, reserved=None):
+    """Apply the same EHECTO username rule used by agent provisioning."""
+    reserved = reserved or set()
+    name = first_name(first_names)
+    last = normalize_token(paternal)
+    initial = candidate_for(last, name, 1) if name and last else ""
+
+    if not name or not last:
+        return {
+            "initial": initial,
+            "username": "",
+            "status": "CONFLICT",
+            "reason": "NAME_OR_LASTNAME_INVALID",
+            "resolved": False,
+            "attempts": [],
+        }
+
+    attempts = []
+    chosen = None
+    for prefix_len in range(1, len(last) + 1):
+        candidate = candidate_for(last, name, prefix_len)
+        if candidate in attempts:
+            continue
+        attempts.append(candidate)
+        if candidate not in existing and candidate not in reserved:
+            chosen = candidate
+            break
+
+    if chosen is None:
+        base = candidate_for(last, name, len(last))
+        suffix = 2
+        while suffix < 10000:
+            suffix_text = str(suffix)
+            candidate = "%s%s" % (
+                base[:USERNAME_MAX_LENGTH - len(suffix_text)],
+                suffix_text,
+            )
+            attempts.append(candidate)
+            if candidate not in existing and candidate not in reserved:
+                chosen = candidate
+                break
+            suffix += 1
+
+    if chosen is None:
+        return {
+            "initial": initial,
+            "username": "",
+            "status": "CONFLICT",
+            "reason": "NO_AVAILABLE_USERNAME",
+            "resolved": False,
+            "attempts": attempts,
+        }
+
+    return {
+        "initial": initial,
+        "username": chosen,
+        "status": "AVAILABLE",
+        "reason": "COLLISION_RESOLVED" if chosen != initial else "AVAILABLE",
+        "resolved": chosen != initial,
+        "attempts": attempts,
+    }
+
+
+def build_person_full_name(first_names, paternal, maternal):
+    parts = [
+        str(first_names or "").strip(),
+        str(paternal or "").strip(),
+        str(maternal or "").strip(),
+    ]
+    return " ".join(part for part in parts if part)
+
+
 def get_group_template(user_group):
     templates = load_group_templates()
     template_user = templates.get(user_group)
@@ -2794,12 +2866,15 @@ class GroupChangeExecuteRequest(GroupChangePreviewRequest):
 
 
 class SupervisorPreviewRequest(BaseModel):
-    username: str = Field(..., min_length=1, max_length=20)
-    full_name: str = Field(..., min_length=1, max_length=50)
+    first_names: str = Field(..., min_length=1, max_length=120)
+    paternal: str = Field(..., min_length=1, max_length=80)
+    maternal: str = Field("", max_length=80)
     user_group: str = Field(..., min_length=1, max_length=20)
 
 
 class SupervisorExecuteRequest(SupervisorPreviewRequest):
+    username: str = Field(..., min_length=1, max_length=20)
+    full_name: str = Field(..., min_length=1, max_length=50)
     extension: str = Field(..., min_length=1, max_length=20)
     idempotency_key: str = Field(..., min_length=8, max_length=128)
 
@@ -4630,11 +4705,12 @@ def supervisor_template_and_phone(cursor):
     return template, phone
 
 
-def supervisor_write_plan(payload, extension):
-    require_managed_group(payload.user_group)
+def supervisor_write_plan(username, full_name, user_group, extension):
+    require_managed_group(user_group)
 
-    username = str(payload.username or "").strip().upper()
-    full_name = str(payload.full_name or "").strip()
+    username = str(username or "").strip().upper()
+    full_name = str(full_name or "").strip()
+    user_group = str(user_group or "").strip()
     extension_text = str(extension or "").strip()
     identity = supervisor_node_identity(extension_text)
 
@@ -4745,7 +4821,7 @@ def supervisor_write_plan(payload, extension):
             "login_user": None,
             "login_pass": None,
             "login_campaign": None,
-            "user_group": payload.user_group,
+            "user_group": user_group,
             "peer_status": "UNKNOWN",
             "ping_time": None,
         }
@@ -4778,7 +4854,7 @@ def supervisor_write_plan(payload, extension):
         "status": "READY" if not unique_blockers else "BLOCKED",
         "username": username,
         "full_name": full_name,
-        "user_group": payload.user_group,
+        "user_group": user_group,
         "user_level": 8,
         "extension": extension_text,
         "phone_login": extension_text,
@@ -4796,8 +4872,58 @@ def supervisor_write_plan(payload, extension):
 
 def supervisor_preview_data(payload):
     require_managed_group(payload.user_group)
+
+    with db_cursor() as cursor:
+        cursor.execute("SELECT user FROM vicidial_users")
+        existing = set(
+            str(row.get("user") or "").upper()
+            for row in cursor.fetchall()
+        )
+
+    username_result = resolve_person_username(
+        payload.first_names,
+        payload.paternal,
+        existing,
+    )
+    full_name = build_person_full_name(
+        payload.first_names,
+        payload.paternal,
+        payload.maternal,
+    )
+
     extension = next_supervisor_extension()
-    plan = supervisor_write_plan(payload, extension)
+
+    if username_result["status"] != "AVAILABLE":
+        return {
+            "mode": "SUPERVISOR_PREVIEW",
+            "status": "BLOCKED",
+            "execution_enabled": False,
+            "first_names": payload.first_names,
+            "paternal": payload.paternal,
+            "maternal": payload.maternal,
+            "username": "",
+            "username_initial": username_result["initial"],
+            "username_attempts": username_result["attempts"],
+            "username_reason": username_result["reason"],
+            "full_name": full_name,
+            "user_group": payload.user_group,
+            "user_level": 8,
+            "extension": extension,
+            "phone_login": extension,
+            "phone_pass": extension,
+            "server_ip": SUPERVISOR_SERVER_IP,
+            "template_user": SUPERVISOR_TEMPLATE_USER,
+            "password_policy": "RANDOM_12_ALNUM_MIXED_CASE",
+            "blockers": [username_result["reason"]],
+            "warnings": [],
+        }
+
+    plan = supervisor_write_plan(
+        username_result["username"],
+        full_name,
+        payload.user_group,
+        extension,
+    )
     return {
         "mode": "SUPERVISOR_PREVIEW",
         "status": plan["status"],
@@ -4806,7 +4932,14 @@ def supervisor_preview_data(payload):
             and CREATE_ENABLED
             and PORTAL_WRITE_ENABLED
         ),
+        "first_names": payload.first_names,
+        "paternal": payload.paternal,
+        "maternal": payload.maternal,
         "username": plan["username"],
+        "username_initial": username_result["initial"],
+        "username_resolved": username_result["resolved"],
+        "username_attempts": username_result["attempts"],
+        "username_reason": username_result["reason"],
         "full_name": plan["full_name"],
         "user_group": plan["user_group"],
         "user_level": 8,
@@ -4821,6 +4954,7 @@ def supervisor_preview_data(payload):
         "blockers": plan["blockers"],
         "warnings": plan["warnings"],
     }
+
 
 
 def random_supervisor_password():
@@ -4934,6 +5068,37 @@ def set_supervisor_operation(idempotency_key, status, result=None, error_text=No
 def execute_supervisor(payload, expose_credentials=False):
     require_managed_group(payload.user_group)
 
+    expected_full_name = build_person_full_name(
+        payload.first_names,
+        payload.paternal,
+        payload.maternal,
+    )
+    if payload.full_name.strip() != expected_full_name:
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_FULL_NAME_PREVIEW_STALE",
+        )
+
+    with db_cursor() as cursor:
+        cursor.execute("SELECT user FROM vicidial_users")
+        existing_users = set(
+            str(row.get("user") or "").upper()
+            for row in cursor.fetchall()
+        )
+    generated = resolve_person_username(
+        payload.first_names,
+        payload.paternal,
+        existing_users,
+    )
+    if (
+        generated["status"] != "AVAILABLE"
+        or generated["username"] != payload.username.strip().upper()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_USERNAME_PREVIEW_STALE",
+        )
+
     # Replays must be resolved before recalculating the next extension because
     # a successful prior attempt already occupies its extension in phones.
     ensure_inventory_db()
@@ -4983,7 +5148,12 @@ def execute_supervisor(payload, expose_credentials=False):
         return reservation["result"]
 
     password = random_supervisor_password()
-    plan = supervisor_write_plan(payload, payload.extension)
+    plan = supervisor_write_plan(
+        payload.username,
+        payload.full_name,
+        payload.user_group,
+        payload.extension,
+    )
     if plan["status"] != "READY":
         set_supervisor_operation(
             payload.idempotency_key,
