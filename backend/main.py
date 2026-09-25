@@ -4929,6 +4929,44 @@ def set_supervisor_operation(idempotency_key, status, result=None, error_text=No
 def execute_supervisor(payload, expose_credentials=False):
     require_managed_group(payload.user_group)
 
+    # Replays must be resolved before recalculating the next extension because
+    # a successful prior attempt already occupies its extension in phones.
+    ensure_inventory_db()
+    replay_db = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    replay_db.row_factory = sqlite3.Row
+    try:
+        existing = replay_db.execute(
+            """
+            SELECT username, user_group, extension, status, result_json
+              FROM supervisor_operations
+             WHERE idempotency_key=?
+            """,
+            (payload.idempotency_key,),
+        ).fetchone()
+    finally:
+        replay_db.close()
+
+    if existing:
+        same_payload = (
+            str(existing["username"]) == payload.username.strip().upper()
+            and str(existing["user_group"]) == payload.user_group.strip()
+            and str(existing["extension"]) == payload.extension.strip()
+        )
+        if (
+            same_payload
+            and str(existing["status"]) == "SUCCESS"
+            and existing["result_json"]
+        ):
+            result = json.loads(existing["result_json"])
+            result["replayed"] = True
+            result["credentials_available"] = False
+            return result
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_IDEMPOTENCY_ALREADY_USED:%s"
+            % str(existing["status"]),
+        )
+
     if payload.extension.strip() != next_supervisor_extension():
         raise HTTPException(
             status_code=409,
