@@ -4502,14 +4502,7 @@ def next_supervisor_extension():
         connection.close()
 
     with db_cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT extension
-              FROM phones
-             WHERE server_ip=%s
-            """,
-            (SUPERVISOR_SERVER_IP,),
-        )
+        cursor.execute("SELECT extension FROM phones")
         used_extensions = set(
             str(row.get("extension") or "")
             for row in cursor.fetchall()
