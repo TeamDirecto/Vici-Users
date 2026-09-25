@@ -90,13 +90,17 @@
           <div class="head"><div><h2>Alta de supervisor</h2><p>Supervisor nivel 8 basado en ADMINSANT02.</p></div><span class="step">Nodo .90</span></div>
           <div class="body">
             <div class="field">
-              <label>Username</label>
-              <input id="supervisorUser" type="text" maxlength="20" placeholder="Ej. JSUPERVISOR" autocomplete="off" />
-              <div class="hint">Se guardará en mayúsculas. Debe ser único en VICIdial.</div>
+              <label>Nombre(s)</label>
+              <input id="supervisorFirstNames" type="text" maxlength="120" placeholder="Ej. Juan Carlos" autocomplete="off" />
             </div>
             <div class="field">
-              <label>Nombre completo</label>
-              <input id="supervisorName" type="text" maxlength="50" placeholder="Ej. JUAN PEREZ LOPEZ" autocomplete="off" />
+              <label>Apellido paterno</label>
+              <input id="supervisorPaternal" type="text" maxlength="80" placeholder="Ej. Pérez" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label>Apellido materno <span style="font-weight:500;color:#64748b">(opcional)</span></label>
+              <input id="supervisorMaternal" type="text" maxlength="80" placeholder="Ej. López" autocomplete="off" />
+              <div class="hint">El User ID se genera automáticamente con la misma regla de agentes: primera letra del apellido paterno + primer nombre; si existe, amplía el apellido.</div>
             </div>
             <div class="field">
               <label>User Group</label>
@@ -119,12 +123,13 @@
 
         <div class="card">
           <div class="head"><div><h2>Previsualización</h2><p>Valida usuario, extensión, plantilla y phone antes de escribir.</p></div><span class="step">Nivel 8</span></div>
-          <div id="supervisorEmpty" class="empty"><strong>Aún no hay supervisor para revisar</strong><p>Captura username, nombre y User Group.</p></div>
+          <div id="supervisorEmpty" class="empty"><strong>Aún no hay supervisor para revisar</strong><p>Captura nombre, apellidos y User Group.</p></div>
           <div id="supervisorResult" class="body hidden">
             <div id="supervisorBlocker" class="conn-error hidden"></div>
             <div class="template">
-              <div><span>Usuario</span><strong id="supUser">—</strong></div>
+              <div><span>User ID generado</span><strong id="supUser">—</strong></div>
               <div><span>Nombre</span><strong id="supName">—</strong></div>
+              <div><span>Regla / intentos</span><strong id="supUserAttempts">—</strong></div>
               <div><span>User Group</span><strong id="supGroup">—</strong></div>
               <div><span>User level</span><strong id="supLevel">8</strong></div>
               <div><span>Extensión</span><strong id="supExtension">—</strong></div>
@@ -905,18 +910,19 @@
 
   function updateSupervisorPreviewButton(){
     const ready=Boolean(
-      $('supervisorUser').value.trim() &&
-      $('supervisorName').value.trim() &&
+      $('supervisorFirstNames').value.trim() &&
+      $('supervisorPaternal').value.trim() &&
       $('supervisorGroup').value
     );
     $('supervisorPreviewBtn').disabled=!ready;
   }
 
   async function previewSupervisor(){
-    const username=$('supervisorUser').value.trim().toUpperCase();
-    const fullName=$('supervisorName').value.trim();
+    const firstNames=$('supervisorFirstNames').value.trim();
+    const paternal=$('supervisorPaternal').value.trim();
+    const maternal=$('supervisorMaternal').value.trim();
     const userGroup=$('supervisorGroup').value;
-    if(!username||!fullName||!userGroup)return;
+    if(!firstNames||!paternal||!userGroup)return;
 
     supervisorPreviewPayload=null;
     supervisorOperationKey=null;
@@ -928,8 +934,9 @@
       const data=await api('/supervisors/preview',{
         method:'POST',
         body:JSON.stringify({
-          username:username,
-          full_name:fullName,
+          first_names:firstNames,
+          paternal:paternal,
+          maternal:maternal,
           user_group:userGroup
         })
       });
@@ -937,6 +944,7 @@
 
       $('supUser').textContent=data.username||'—';
       $('supName').textContent=data.full_name||'—';
+      $('supUserAttempts').textContent=(data.username_attempts||[]).join(' → ')||data.username_initial||'—';
       $('supGroup').textContent=data.user_group||'—';
       $('supLevel').textContent=String(data.user_level||8);
       $('supExtension').textContent=data.extension||'—';
@@ -963,7 +971,7 @@
       );
       $('supervisorCreateBtn').disabled=!canCreate;
       $('supervisorCreateHint').textContent=canCreate
-        ? 'Listo: al crear se generará el password aleatorio y se mostrará una sola vez.'
+        ? 'Listo: el User ID ya fue resuelto; al crear se generará el password aleatorio y se mostrará una sola vez.'
         : 'La ejecución requiere sesión admin, portal write habilitado y preview sin bloqueos.';
       toast(canCreate?'Supervisor listo para crear.':'Preview completado con bloqueos.');
     }catch(error){
@@ -1000,6 +1008,9 @@
       const result=await api('/supervisors/execute',{
         method:'POST',
         body:JSON.stringify({
+          first_names:data.first_names,
+          paternal:data.paternal,
+          maternal:data.maternal||'',
           username:data.username,
           full_name:data.full_name,
           user_group:data.user_group,
@@ -1308,7 +1319,7 @@
   $('cancelCreateBtn').addEventListener('click',closeCreateConfirmation);
   $('confirmCreateBtn').addEventListener('click',executePortalProvisioning);
   $('navProvision').addEventListener('click',()=>showView('provision'));$('navSupervisors').addEventListener('click',()=>showView('supervisors'));$('navGroupChange').addEventListener('click',()=>showView('group-change'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
-  $('supervisorUser').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorName').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorGroup').addEventListener('change',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorPreviewBtn').addEventListener('click',previewSupervisor);$('supervisorCreateBtn').addEventListener('click',createSupervisor);
+  $('supervisorFirstNames').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorPaternal').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorMaternal').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorGroup').addEventListener('change',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorPreviewBtn').addEventListener('click',previewSupervisor);$('supervisorCreateBtn').addEventListener('click',createSupervisor);
   $('groupChangeUser').addEventListener('input',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true;updateGroupChangePreviewButton()});$('groupChangeSourceExtension').addEventListener('input',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true});$('groupChangeTarget').addEventListener('change',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true;updateGroupChangePreviewButton()});$('groupChangePreviewBtn').addEventListener('click',previewGroupChange);$('groupChangeApplyBtn').addEventListener('click',applyGroupChange);
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
   $('togglePass').addEventListener('click',()=>{const f=$('agentPass');const show=f.type==='password';f.type=show?'text':'password';$('togglePass').textContent=show?'Ocultar':'Mostrar'});
