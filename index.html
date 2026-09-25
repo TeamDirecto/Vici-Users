@@ -957,7 +957,15 @@
       $('supPasswordPolicy').textContent='12 alfanumérico aleatorio';
 
       const blockers=data.blockers||[];
-      $('supervisorBlocker').textContent=blockers.length?'Bloqueado: '+blockers.join(' · '):'';
+      const supervisorBlockerText=blockers.map(code=>{
+        if(code==='SUPERVISOR_TEMPLATE_USER_MISSING')return 'No existe la plantilla de supervisor ADMINSANT02.';
+        if(code==='SUPERVISOR_TEMPLATE_NOT_LEVEL_8')return 'ADMINSANT02 no tiene user_level 8.';
+        if(code==='SUPERVISOR_TEMPLATE_NOT_ACTIVE')return 'ADMINSANT02 no está activo.';
+        if(code==='SUPERVISOR_PHONE_TEMPLATE_MISSING_FOR_GROUP_ON_NODE_90')return 'No existe un phone activo del User Group seleccionado en el nodo 172.20.21.90 para usarlo como plantilla técnica.';
+        if(code==='SUPERVISOR_TEMPLATE_PHONE_INVALID')return 'El phone técnico encontrado en el nodo .90 no tiene template_id/conf_secret válidos.';
+        return code;
+      });
+      $('supervisorBlocker').textContent=blockers.length?'Bloqueado: '+supervisorBlockerText.join(' · '):'';
       $('supervisorBlocker').classList.toggle('hidden',!blockers.length);
       $('supervisorEmpty').classList.add('hidden');
       $('supervisorResult').classList.remove('hidden');
