@@ -45,6 +45,12 @@ PORTAL_WRITE_ENABLED = os.getenv(
     "VICI_USERS_PORTAL_WRITE_ENABLED", "false"
 ).lower() in {"1", "true", "yes", "y"}
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
+SUPERVISOR_TEMPLATE_USER = os.getenv("VICI_USERS_SUPERVISOR_TEMPLATE_USER", "ADMINSANT02").strip()
+SUPERVISOR_SERVER_IP = os.getenv("VICI_USERS_SUPERVISOR_SERVER_IP", "172.20.21.90").strip()
+SUPERVISOR_EXTENSION_START = int(os.getenv("VICI_USERS_SUPERVISOR_EXTENSION_START", "1064"))
+SUPERVISOR_EXTENSION_END = int(os.getenv("VICI_USERS_SUPERVISOR_EXTENSION_END", "9999"))
+SUPERVISOR_PASSWORD_LENGTH = 12
+SUPERVISOR_PASSWORD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 GROUP_TEMPLATES_FILE = Path(
     os.getenv("VICI_USERS_GROUP_TEMPLATES_FILE", "/etc/vici-users/group_templates.json")
 )
@@ -126,7 +132,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.19.1-group-change-legacy-source")
+app = FastAPI(title="Vici-Users API", version="0.20.0-supervisors")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2392,6 +2398,27 @@ def ensure_inventory_db():
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS supervisor_operations (
+                    idempotency_key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    full_name TEXT NOT NULL,
+                    user_group TEXT NOT NULL,
+                    extension TEXT NOT NULL,
+                    server_ip TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    error_text TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_supervisor_operations_target "
+                "ON supervisor_operations(extension, username, status)"
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS auth_sessions (
                     token_hash TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -2763,6 +2790,17 @@ class GroupChangePreviewRequest(BaseModel):
 class GroupChangeExecuteRequest(GroupChangePreviewRequest):
     source_extension: str = Field(..., min_length=1, max_length=20)
     target_extension: str = Field(..., min_length=1, max_length=20)
+    idempotency_key: str = Field(..., min_length=8, max_length=128)
+
+
+class SupervisorPreviewRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=20)
+    full_name: str = Field(..., min_length=1, max_length=50)
+    user_group: str = Field(..., min_length=1, max_length=20)
+
+
+class SupervisorExecuteRequest(SupervisorPreviewRequest):
+    extension: str = Field(..., min_length=1, max_length=20)
     idempotency_key: str = Field(..., min_length=8, max_length=128)
 
 
@@ -4401,6 +4439,851 @@ def group_change_execute_route(
     record_auth_event(
         session["username"],
         "GROUP_CHANGE_SUCCESS",
+        request,
+        audit_detail,
+    )
+    return result
+
+
+
+def supervisor_node_identity(extension):
+    extension_text = str(extension or "").strip()
+    if not extension_text.isdigit():
+        raise HTTPException(status_code=400, detail="SUPERVISOR_EXTENSION_INVALID")
+
+    extension_number = int(extension_text)
+    if (
+        extension_number < SUPERVISOR_EXTENSION_START
+        or extension_number > SUPERVISOR_EXTENSION_END
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_EXTENSION_OUT_OF_RANGE",
+        )
+
+    topology = load_cluster_nodes()
+    matches = [
+        node for node in topology["nodes"]
+        if str(node.get("server_ip") or "") == SUPERVISOR_SERVER_IP
+    ]
+    if len(matches) != 1:
+        raise HTTPException(
+            status_code=503,
+            detail="SUPERVISOR_NODE_NOT_CONFIGURED",
+        )
+
+    node = matches[0]
+    return {
+        "server_ip": SUPERVISOR_SERVER_IP,
+        "extension": extension_text,
+        "login": extension_text + str(node.get("login_suffix") or ""),
+        "dialplan_number": str(node.get("dialplan_prefix") or "") + extension_text,
+        "login_suffix": str(node.get("login_suffix") or ""),
+        "dialplan_prefix": str(node.get("dialplan_prefix") or ""),
+    }
+
+
+def next_supervisor_extension():
+    ensure_inventory_db()
+
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        reserved = set(
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT extension
+                  FROM supervisor_operations
+                 WHERE status IN ('RESERVED','RUNNING','SUCCESS','ERROR')
+                """
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT extension
+              FROM phones
+             WHERE server_ip=%s
+            """,
+            (SUPERVISOR_SERVER_IP,),
+        )
+        used_extensions = set(
+            str(row.get("extension") or "")
+            for row in cursor.fetchall()
+        )
+
+        cursor.execute("SELECT alias_id FROM phones_alias")
+        used_aliases = set(
+            str(row.get("alias_id") or "")
+            for row in cursor.fetchall()
+        )
+
+    for value in range(SUPERVISOR_EXTENSION_START, SUPERVISOR_EXTENSION_END + 1):
+        extension = str(value)
+        if (
+            extension not in used_extensions
+            and extension not in used_aliases
+            and extension not in reserved
+        ):
+            return extension
+
+    raise HTTPException(
+        status_code=409,
+        detail="NO_SUPERVISOR_EXTENSION_AVAILABLE",
+    )
+
+
+def supervisor_template_and_phone(cursor):
+    template_fields = [
+        "user", "full_name", "user_level", "user_group", "active",
+        "phone_login", "phone_pass",
+    ] + list(USER_CLONE_FIELDS)
+    select_sql = ", ".join("`%s`" % field for field in template_fields)
+    cursor.execute(
+        "SELECT %s FROM vicidial_users WHERE user=%%s LIMIT 1" % select_sql,
+        (SUPERVISOR_TEMPLATE_USER,),
+    )
+    template = cursor.fetchone()
+    if not template:
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_TEMPLATE_USER_MISSING",
+        )
+    if int(template.get("user_level") or 0) != 8:
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_TEMPLATE_NOT_LEVEL_8",
+        )
+    if str(template.get("active") or "").upper() != "Y":
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_TEMPLATE_NOT_ACTIVE",
+        )
+
+    source_phone_login = str(template.get("phone_login") or "").strip()
+    if not source_phone_login:
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_TEMPLATE_PHONE_LOGIN_MISSING",
+        )
+
+    candidate_logins = [source_phone_login]
+    cursor.execute(
+        """
+        SELECT logins_list
+          FROM phones_alias
+         WHERE alias_id=%s
+         LIMIT 1
+        """,
+        (source_phone_login,),
+    )
+    alias_row = cursor.fetchone()
+    if alias_row and alias_row.get("logins_list"):
+        candidate_logins = [
+            item.strip()
+            for item in str(alias_row["logins_list"]).split(",")
+            if item.strip()
+        ]
+
+    phone = None
+    if candidate_logins:
+        placeholders = ",".join(["%s"] * len(candidate_logins))
+        cursor.execute(
+            """
+            SELECT *
+              FROM phones
+             WHERE server_ip=%s
+               AND login IN (%s)
+             ORDER BY extension
+             LIMIT 1
+            """ % ("%s", placeholders),
+            tuple([SUPERVISOR_SERVER_IP] + candidate_logins),
+        )
+        phone = cursor.fetchone()
+
+    if not phone:
+        cursor.execute(
+            """
+            SELECT *
+              FROM phones
+             WHERE server_ip=%s
+               AND extension=%s
+             LIMIT 1
+            """,
+            (SUPERVISOR_SERVER_IP, source_phone_login),
+        )
+        phone = cursor.fetchone()
+
+    if not phone:
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_TEMPLATE_PHONE_MISSING_ON_NODE_90",
+        )
+
+    if not phone.get("template_id") or not phone.get("conf_secret"):
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_TEMPLATE_PHONE_INVALID",
+        )
+
+    return template, phone
+
+
+def supervisor_write_plan(payload, extension):
+    require_managed_group(payload.user_group)
+
+    username = str(payload.username or "").strip().upper()
+    full_name = str(payload.full_name or "").strip()
+    extension_text = str(extension or "").strip()
+    identity = supervisor_node_identity(extension_text)
+
+    blockers = []
+    warnings = []
+
+    if not username or len(username) > USERNAME_MAX_LENGTH:
+        blockers.append("INVALID_USERNAME_LENGTH")
+    elif not all(ch.isalnum() or ch == "_" for ch in username):
+        blockers.append("INVALID_USERNAME_CHARACTERS")
+
+    if not full_name:
+        blockers.append("FULL_NAME_REQUIRED")
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT user FROM vicidial_users WHERE user=%s LIMIT 1",
+            (username,),
+        )
+        if cursor.fetchone():
+            blockers.append("TARGET_USER_ALREADY_EXISTS")
+
+        cursor.execute(
+            "SELECT extension FROM phones WHERE extension=%s LIMIT 1",
+            (extension_text,),
+        )
+        if cursor.fetchone():
+            blockers.append("TARGET_EXTENSION_ALREADY_EXISTS")
+
+        cursor.execute(
+            "SELECT alias_id FROM phones_alias WHERE alias_id=%s LIMIT 1",
+            (extension_text,),
+        )
+        if cursor.fetchone():
+            blockers.append("TARGET_PHONE_ALIAS_ALREADY_EXISTS")
+
+        cursor.execute(
+            "SELECT extension FROM phones WHERE login=%s LIMIT 1",
+            (identity["login"],),
+        )
+        if cursor.fetchone():
+            blockers.append("TARGET_LOGIN_COLLISION")
+
+        cursor.execute(
+            "SELECT extension FROM phones WHERE dialplan_number=%s LIMIT 1",
+            (identity["dialplan_number"],),
+        )
+        if cursor.fetchone():
+            blockers.append("TARGET_DIALPLAN_COLLISION")
+
+        cursor.execute("SHOW COLUMNS FROM vicidial_users")
+        user_schema = set(row["Field"] for row in cursor.fetchall())
+        required_user_fields = set(
+            ["user", "pass", "full_name", "user_level", "user_group",
+             "active", "phone_login", "phone_pass"] + list(USER_CLONE_FIELDS)
+        )
+        if not required_user_fields.issubset(user_schema):
+            blockers.append("SUPERVISOR_USER_SCHEMA_MISMATCH")
+
+        template, source_phone = supervisor_template_and_phone(cursor)
+
+        cursor.execute("SHOW COLUMNS FROM phones")
+        phone_columns = [row["Field"] for row in cursor.fetchall()]
+
+        source_extension = str(source_phone.get("extension") or "")
+        phone_override_fields = {
+            "extension", "dialplan_number", "voicemail_id",
+            "phone_ip", "computer_ip", "server_ip", "login", "pass",
+            "status", "active", "fullname", "messages", "old_messages",
+            "login_user", "login_pass", "login_campaign", "user_group",
+            "peer_status", "ping_time",
+        }
+
+        unmapped_references = []
+        for field, value in source_phone.items():
+            if field in phone_override_fields or value is None:
+                continue
+            if source_extension and source_extension in str(value):
+                unmapped_references.append(field)
+
+        if unmapped_references:
+            blockers.extend(
+                "UNMAPPED_SUPERVISOR_PHONE_REFERENCE:%s" % field
+                for field in unmapped_references
+            )
+
+        source_fullname = str(source_phone.get("fullname") or "")
+        target_fullname = (
+            source_fullname.replace(source_extension, extension_text)
+            if source_extension and source_extension in source_fullname
+            else source_fullname
+        )
+
+        override_values = {
+            "extension": extension_text,
+            "dialplan_number": identity["dialplan_number"],
+            "voicemail_id": extension_text,
+            "phone_ip": None,
+            "computer_ip": None,
+            "server_ip": SUPERVISOR_SERVER_IP,
+            "login": identity["login"],
+            "pass": extension_text,
+            "status": "ACTIVE",
+            "active": "N",
+            "fullname": target_fullname,
+            "messages": 0,
+            "old_messages": 0,
+            "login_user": None,
+            "login_pass": None,
+            "login_campaign": None,
+            "user_group": payload.user_group,
+            "peer_status": "UNKNOWN",
+            "ping_time": None,
+        }
+
+        select_parts = []
+        safe_parameters = []
+        for field in phone_columns:
+            if field in override_values:
+                select_parts.append("%s AS `%s`" % ("%s", field))
+                safe_parameters.append(override_values[field])
+            else:
+                select_parts.append("`%s`" % field)
+
+        columns_sql = ", ".join("`%s`" % field for field in phone_columns)
+        select_sql = ", ".join(select_parts)
+        phone_sql = (
+            "INSERT INTO phones (%s) "
+            "SELECT %s FROM phones "
+            "WHERE extension=%%s AND server_ip=%%s LIMIT 1"
+            % (columns_sql, select_sql)
+        )
+        safe_parameters.extend([source_extension, SUPERVISOR_SERVER_IP])
+
+    unique_blockers = []
+    for blocker in blockers:
+        if blocker not in unique_blockers:
+            unique_blockers.append(blocker)
+
+    return {
+        "status": "READY" if not unique_blockers else "BLOCKED",
+        "username": username,
+        "full_name": full_name,
+        "user_group": payload.user_group,
+        "user_level": 8,
+        "extension": extension_text,
+        "phone_login": extension_text,
+        "phone_pass": extension_text,
+        "template_user": SUPERVISOR_TEMPLATE_USER,
+        "server_ip": SUPERVISOR_SERVER_IP,
+        "phone_identity": identity,
+        "phone_template_extension": source_extension,
+        "phone_sql": phone_sql,
+        "phone_parameters": safe_parameters,
+        "blockers": unique_blockers,
+        "warnings": warnings,
+    }
+
+
+def supervisor_preview_data(payload):
+    require_managed_group(payload.user_group)
+    extension = next_supervisor_extension()
+    plan = supervisor_write_plan(payload, extension)
+    return {
+        "mode": "SUPERVISOR_PREVIEW",
+        "status": plan["status"],
+        "execution_enabled": bool(
+            plan["status"] == "READY"
+            and CREATE_ENABLED
+            and PORTAL_WRITE_ENABLED
+        ),
+        "username": plan["username"],
+        "full_name": plan["full_name"],
+        "user_group": plan["user_group"],
+        "user_level": 8,
+        "extension": extension,
+        "phone_login": extension,
+        "phone_pass": extension,
+        "phone_record_login": plan["phone_identity"]["login"],
+        "dialplan_number": plan["phone_identity"]["dialplan_number"],
+        "server_ip": SUPERVISOR_SERVER_IP,
+        "template_user": SUPERVISOR_TEMPLATE_USER,
+        "password_policy": "RANDOM_12_ALNUM_MIXED_CASE",
+        "blockers": plan["blockers"],
+        "warnings": plan["warnings"],
+    }
+
+
+def random_supervisor_password():
+    while True:
+        password = "".join(
+            secrets.choice(SUPERVISOR_PASSWORD_ALPHABET)
+            for _ in range(SUPERVISOR_PASSWORD_LENGTH)
+        )
+        if (
+            any(ch.islower() for ch in password)
+            and any(ch.isupper() for ch in password)
+            and any(ch.isdigit() for ch in password)
+        ):
+            return password
+
+
+def reserve_supervisor_operation(payload):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            """
+            SELECT *
+              FROM supervisor_operations
+             WHERE idempotency_key=?
+            """,
+            (payload.idempotency_key,),
+        ).fetchone()
+        if existing:
+            connection.rollback()
+            if (
+                str(existing["status"]) == "SUCCESS"
+                and existing["result_json"]
+                and str(existing["username"]) == payload.username.strip().upper()
+                and str(existing["user_group"]) == payload.user_group.strip()
+                and str(existing["extension"]) == payload.extension.strip()
+            ):
+                result = json.loads(existing["result_json"])
+                result["replayed"] = True
+                result["credentials_available"] = False
+                return {"replay": True, "result": result}
+            raise HTTPException(
+                status_code=409,
+                detail="SUPERVISOR_IDEMPOTENCY_ALREADY_USED",
+            )
+
+        busy = connection.execute(
+            """
+            SELECT idempotency_key
+              FROM supervisor_operations
+             WHERE extension=?
+               AND status IN ('RESERVED','RUNNING','SUCCESS','ERROR')
+             LIMIT 1
+            """,
+            (payload.extension.strip(),),
+        ).fetchone()
+        if busy:
+            connection.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="SUPERVISOR_EXTENSION_ALREADY_RESERVED",
+            )
+
+        connection.execute(
+            """
+            INSERT INTO supervisor_operations
+                (idempotency_key, username, full_name, user_group,
+                 extension, server_ip, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'RESERVED')
+            """,
+            (
+                payload.idempotency_key,
+                payload.username.strip().upper(),
+                payload.full_name.strip(),
+                payload.user_group.strip(),
+                payload.extension.strip(),
+                SUPERVISOR_SERVER_IP,
+            ),
+        )
+        connection.commit()
+        return {"replay": False}
+    finally:
+        connection.close()
+
+
+def set_supervisor_operation(idempotency_key, status, result=None, error_text=None):
+    ensure_inventory_db()
+    connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    try:
+        connection.execute(
+            """
+            UPDATE supervisor_operations
+               SET status=?, result_json=?, error_text=?,
+                   updated_at=CURRENT_TIMESTAMP
+             WHERE idempotency_key=?
+            """,
+            (
+                status,
+                json.dumps(result, sort_keys=True) if result is not None else None,
+                error_text[:1000] if error_text else None,
+                idempotency_key,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def execute_supervisor(payload, expose_credentials=False):
+    require_managed_group(payload.user_group)
+
+    if payload.extension.strip() != next_supervisor_extension():
+        raise HTTPException(
+            status_code=409,
+            detail="SUPERVISOR_EXTENSION_PREVIEW_STALE",
+        )
+
+    reservation = reserve_supervisor_operation(payload)
+    if reservation.get("replay"):
+        return reservation["result"]
+
+    password = random_supervisor_password()
+    plan = supervisor_write_plan(payload, payload.extension)
+    if plan["status"] != "READY":
+        set_supervisor_operation(
+            payload.idempotency_key,
+            "COMPENSATED",
+            error_text="WRITE_PLAN_BLOCKED:%s" % ",".join(plan["blockers"]),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SUPERVISOR_WRITE_PLAN_BLOCKED",
+                "blockers": plan["blockers"],
+            },
+        )
+
+    connection = None
+    phone_inserted = False
+    alias_inserted = False
+    user_inserted = False
+
+    try:
+        set_supervisor_operation(payload.idempotency_key, "RUNNING")
+        cfg = db_config()
+        cfg["autocommit"] = True
+        connection = pymysql.connect(**cfg)
+        cursor = connection.cursor()
+
+        cursor.execute(
+            plan["phone_sql"],
+            tuple(plan["phone_parameters"]),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("SUPERVISOR_PHONE_INSERT_ROWCOUNT:%s" % cursor.rowcount)
+        phone_inserted = True
+
+        identity = plan["phone_identity"]
+        cursor.execute(
+            """
+            SELECT extension, server_ip, login, dialplan_number, active, user_group
+              FROM phones
+             WHERE extension=%s
+               AND server_ip=%s
+             LIMIT 1
+            """,
+            (payload.extension, SUPERVISOR_SERVER_IP),
+        )
+        staged_phone = cursor.fetchone()
+        if (
+            not staged_phone
+            or str(staged_phone.get("login") or "") != identity["login"]
+            or str(staged_phone.get("dialplan_number") or "") != identity["dialplan_number"]
+            or str(staged_phone.get("active") or "").upper() != "N"
+            or str(staged_phone.get("user_group") or "") != payload.user_group
+        ):
+            raise RuntimeError("SUPERVISOR_PHONE_STAGE_VALIDATION_FAILED")
+
+        cursor.execute(
+            """
+            INSERT INTO phones_alias
+                (alias_id, alias_name, logins_list, user_group)
+            VALUES (%s, %s, %s, '---ALL---')
+            """,
+            (
+                payload.extension,
+                payload.extension,
+                identity["login"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("SUPERVISOR_ALIAS_INSERT_ROWCOUNT:%s" % cursor.rowcount)
+        alias_inserted = True
+
+        user_columns = [
+            "user", "pass", "full_name", "user_level", "user_group",
+            "active", "phone_login", "phone_pass",
+        ] + list(USER_CLONE_FIELDS)
+        user_columns_sql = ", ".join("`%s`" % field for field in user_columns)
+        user_select_sql = ", ".join(
+            ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s"]
+            + ["`%s`" % field for field in USER_CLONE_FIELDS]
+        )
+        user_insert_sql = (
+            "INSERT INTO vicidial_users (%s) "
+            "SELECT %s FROM vicidial_users "
+            "WHERE user=%%s LIMIT 1"
+            % (user_columns_sql, user_select_sql)
+        )
+
+        cursor.execute(
+            user_insert_sql,
+            tuple([
+                payload.username.strip().upper(),
+                password,
+                payload.full_name.strip(),
+                8,
+                payload.user_group.strip(),
+                "N",
+                payload.extension.strip(),
+                payload.extension.strip(),
+                SUPERVISOR_TEMPLATE_USER,
+            ]),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("SUPERVISOR_USER_INSERT_ROWCOUNT:%s" % cursor.rowcount)
+        user_inserted = True
+
+        cursor.execute(
+            """
+            UPDATE phones
+               SET active='Y'
+             WHERE extension=%s
+               AND server_ip=%s
+               AND user_group=%s
+               AND active='N'
+            """,
+            (
+                payload.extension,
+                SUPERVISOR_SERVER_IP,
+                payload.user_group,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("SUPERVISOR_PHONE_ACTIVATE_ROWCOUNT:%s" % cursor.rowcount)
+
+        cursor.execute(
+            """
+            UPDATE vicidial_users
+               SET active='Y'
+             WHERE user=%s
+               AND user_group=%s
+               AND user_level=8
+               AND active='N'
+            """,
+            (
+                payload.username.strip().upper(),
+                payload.user_group,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("SUPERVISOR_USER_ACTIVATE_ROWCOUNT:%s" % cursor.rowcount)
+
+        cursor.execute(
+            """
+            SELECT user, full_name, user_level, user_group, active,
+                   phone_login, phone_pass
+              FROM vicidial_users
+             WHERE user=%s
+             LIMIT 1
+            """,
+            (payload.username.strip().upper(),),
+        )
+        final_user = cursor.fetchone()
+        if (
+            not final_user
+            or int(final_user.get("user_level") or 0) != 8
+            or str(final_user.get("user_group") or "") != payload.user_group
+            or str(final_user.get("active") or "").upper() != "Y"
+            or str(final_user.get("phone_login") or "") != payload.extension
+            or str(final_user.get("phone_pass") or "") != payload.extension
+        ):
+            raise RuntimeError("SUPERVISOR_FINAL_USER_VALIDATION_FAILED")
+
+        cursor.execute(
+            """
+            SELECT extension, server_ip, login, dialplan_number, active, user_group
+              FROM phones
+             WHERE extension=%s
+               AND server_ip=%s
+             LIMIT 1
+            """,
+            (payload.extension, SUPERVISOR_SERVER_IP),
+        )
+        final_phone = cursor.fetchone()
+        if (
+            not final_phone
+            or str(final_phone.get("active") or "").upper() != "Y"
+            or str(final_phone.get("login") or "") != identity["login"]
+        ):
+            raise RuntimeError("SUPERVISOR_FINAL_PHONE_VALIDATION_FAILED")
+
+        result = {
+            "status": "SUCCESS",
+            "write_performed": True,
+            "operation": "SUPERVISOR_CREATE",
+            "idempotency_key": payload.idempotency_key,
+            "username": payload.username.strip().upper(),
+            "full_name": payload.full_name.strip(),
+            "user_level": 8,
+            "user_group": payload.user_group.strip(),
+            "extension": payload.extension.strip(),
+            "phone_login": payload.extension.strip(),
+            "phone_pass": payload.extension.strip(),
+            "phone_record_login": identity["login"],
+            "dialplan_number": identity["dialplan_number"],
+            "server_ip": SUPERVISOR_SERVER_IP,
+            "template_user": SUPERVISOR_TEMPLATE_USER,
+            "credentials_available": False,
+        }
+        set_supervisor_operation(
+            payload.idempotency_key,
+            "SUCCESS",
+            result=result,
+        )
+
+        if expose_credentials:
+            response = dict(result)
+            response["credentials_available"] = True
+            response["credentials"] = {
+                "username": payload.username.strip().upper(),
+                "password": password,
+                "phone": payload.extension.strip(),
+            }
+            return response
+
+        return result
+
+    except Exception as exc:
+        compensation_errors = []
+        if connection:
+            cursor = connection.cursor()
+            try:
+                if user_inserted:
+                    cursor.execute(
+                        "DELETE FROM vicidial_users WHERE user=%s AND user_group=%s",
+                        (
+                            payload.username.strip().upper(),
+                            payload.user_group,
+                        ),
+                    )
+            except Exception as item_exc:
+                compensation_errors.append(
+                    "USER:%s" % item_exc.__class__.__name__
+                )
+            try:
+                if alias_inserted:
+                    cursor.execute(
+                        "DELETE FROM phones_alias WHERE alias_id=%s",
+                        (payload.extension,),
+                    )
+            except Exception as item_exc:
+                compensation_errors.append(
+                    "ALIAS:%s" % item_exc.__class__.__name__
+                )
+            try:
+                if phone_inserted:
+                    cursor.execute(
+                        """
+                        DELETE FROM phones
+                         WHERE extension=%s
+                           AND server_ip=%s
+                           AND user_group=%s
+                        """,
+                        (
+                            payload.extension,
+                            SUPERVISOR_SERVER_IP,
+                            payload.user_group,
+                        ),
+                    )
+            except Exception as item_exc:
+                compensation_errors.append(
+                    "PHONE:%s" % item_exc.__class__.__name__
+                )
+
+        error_text = "%s:%s" % (exc.__class__.__name__, str(exc))
+        if compensation_errors:
+            error_text += " | " + ",".join(compensation_errors)
+
+        set_supervisor_operation(
+            payload.idempotency_key,
+            "ERROR" if compensation_errors else "COMPENSATED",
+            error_text=error_text,
+        )
+
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SUPERVISOR_PROVISIONING_FAILED",
+                "compensation_ok": not compensation_errors,
+                "error": error_text[:500],
+            },
+        )
+    finally:
+        if connection:
+            connection.close()
+
+
+@app.post("/api/supervisors/preview")
+def supervisor_preview_route(payload: SupervisorPreviewRequest, request: Request):
+    require_operator_session(request, allowed_roles={"admin"})
+    return supervisor_preview_data(payload)
+
+
+@app.post("/api/supervisors/execute")
+def supervisor_execute_route(payload: SupervisorExecuteRequest, request: Request):
+    session = require_portal_write_gate(request)
+
+    if not re.match(r"^[A-Za-z0-9._:-]+$", payload.idempotency_key):
+        raise HTTPException(
+            status_code=400,
+            detail="idempotency_key contiene caracteres no permitidos",
+        )
+
+    audit_detail = (
+        "idempotency_key=%s username=%s user_group=%s extension=%s server_ip=%s"
+        % (
+            payload.idempotency_key,
+            payload.username.strip().upper(),
+            payload.user_group.strip(),
+            payload.extension.strip(),
+            SUPERVISOR_SERVER_IP,
+        )
+    )
+    record_auth_event(
+        session["username"],
+        "SUPERVISOR_CREATE_REQUEST",
+        request,
+        audit_detail,
+    )
+
+    try:
+        result = execute_supervisor(payload, expose_credentials=True)
+    except HTTPException as exc:
+        record_auth_event(
+            session["username"],
+            "SUPERVISOR_CREATE_FAILED",
+            request,
+            audit_detail + " http_status=%s" % exc.status_code,
+        )
+        raise
+
+    result["requested_by"] = session["username"]
+    result["request_source"] = "PORTAL"
+    record_auth_event(
+        session["username"],
+        "SUPERVISOR_CREATE_SUCCESS",
         request,
         audit_detail,
     )
