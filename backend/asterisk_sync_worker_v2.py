@@ -272,6 +272,53 @@ def discover_group_change_jobs(connection):
     return len(rows)
 
 
+def discover_supervisor_jobs(connection):
+    """Queue rebuild/reload jobs for level-8 supervisors created on node 90."""
+    table = connection.execute(
+        """
+        SELECT name
+          FROM sqlite_master
+         WHERE type='table'
+           AND name='supervisor_operations'
+        """
+    ).fetchone()
+    if not table:
+        return 0
+
+    rows = connection.execute(
+        """
+        SELECT s.idempotency_key, s.extension, s.username, s.server_ip
+          FROM supervisor_operations s
+          LEFT JOIN asterisk_sync_jobs j
+            ON j.idempotency_key=('SUP:' || s.idempotency_key)
+         WHERE s.status='SUCCESS'
+           AND j.idempotency_key IS NULL
+         ORDER BY s.updated_at, s.idempotency_key
+        """
+    ).fetchall()
+
+    for item in rows:
+        required_json = json.dumps([str(item["server_ip"])], sort_keys=True)
+        connection.execute(
+            """
+            INSERT INTO asterisk_sync_jobs
+                (idempotency_key, extension, username,
+                 required_servers_json, eligible_servers_json,
+                 ineligible_servers_json, status, updated_at)
+            VALUES (?, ?, ?, ?, '[]', '[]', 'NEW', ?)
+            """,
+            (
+                "SUP:" + str(item["idempotency_key"]),
+                str(item["extension"]),
+                str(item["username"] or ""),
+                required_json,
+                base.now_text(),
+            ),
+        )
+    connection.commit()
+    return len(rows)
+
+
 def run_once(bootstrap_only=False):
     if not base.INVENTORY_DB_FILE.exists():
         raise RuntimeError("INVENTORY_DB_NOT_FOUND:%s" % base.INVENTORY_DB_FILE)
@@ -289,14 +336,20 @@ def run_once(bootstrap_only=False):
 
         discovered_provisioning = base.discover_new_jobs(sqlite_db)
         discovered_group_changes = discover_group_change_jobs(sqlite_db)
-        discovered = discovered_provisioning + discovered_group_changes
+        discovered_supervisors = discover_supervisor_jobs(sqlite_db)
+        discovered = (
+            discovered_provisioning
+            + discovered_group_changes
+            + discovered_supervisors
+        )
         if discovered:
             print(
-                "DISCOVERED new_sync_jobs=%d provisioning=%d group_change=%d"
+                "DISCOVERED new_sync_jobs=%d provisioning=%d group_change=%d supervisors=%d"
                 % (
                     discovered,
                     discovered_provisioning,
                     discovered_group_changes,
+                    discovered_supervisors,
                 )
             )
 
