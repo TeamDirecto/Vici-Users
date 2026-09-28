@@ -2028,6 +2028,7 @@ def replay_provisioning_operation_if_known(payload):
         connection.close()
 
 
+
 def reserve_provisioning_operation(payload):
     ensure_inventory_db()
     connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
@@ -2062,7 +2063,11 @@ def reserve_provisioning_operation(payload):
             if existing["status"] == "SUCCESS" and existing["result_json"]:
                 result = json.loads(existing["result_json"])
                 connection.commit()
-                return {"replay": True, "result": result}
+                return {
+                    "replay": True,
+                    "result": result,
+                    "source": str(result.get("extension_source") or "UNCREATED"),
+                }
 
             status = str(existing["status"])
             connection.rollback()
@@ -2073,25 +2078,43 @@ def reserve_provisioning_operation(payload):
 
         inventory = connection.execute(
             """
-            SELECT extension, user_group, status, current_user
+            SELECT extension, user_group, status, current_user,
+                   previous_user, released_at
               FROM extension_inventory
              WHERE extension=?
             """,
             (payload.extension,),
         ).fetchone()
 
+        source = "UNCREATED"
         if inventory:
-            connection.rollback()
-            if str(inventory["status"]).upper() == "FREE":
+            inventory_status = str(inventory["status"] or "").upper()
+            if inventory_status != "FREE":
+                connection.rollback()
                 raise HTTPException(
                     status_code=409,
-                    detail="FREE_REUSE_NOT_IMPLEMENTED_IN_EXECUTOR_V1",
+                    detail="EXTENSION_ALREADY_RESERVED_OR_MANAGED:%s"
+                    % inventory_status,
                 )
-            raise HTTPException(
-                status_code=409,
-                detail="EXTENSION_ALREADY_RESERVED_OR_MANAGED:%s"
-                % str(inventory["status"]),
-            )
+            if str(inventory["user_group"] or "") != payload.user_group:
+                connection.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="FREE_INVENTORY_GROUP_MISMATCH",
+                )
+            if inventory["current_user"]:
+                connection.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="FREE_INVENTORY_CURRENT_USER_PRESENT",
+                )
+            if not inventory["released_at"]:
+                connection.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="FREE_RELEASE_TIMESTAMP_MISSING",
+                )
+            source = "FREE"
 
         connection.execute(
             """
@@ -2108,37 +2131,74 @@ def reserve_provisioning_operation(payload):
                 payload.extension,
             ),
         )
-        connection.execute(
-            """
-            INSERT INTO extension_inventory
-                (extension, user_group, status, current_user,
-                 reserved_at, updated_at, note)
-            VALUES (?, ?, 'RESERVED', ?, CURRENT_TIMESTAMP,
-                    CURRENT_TIMESTAMP, ?)
-            """,
-            (
-                payload.extension,
-                payload.user_group,
-                payload.username.upper(),
-                "Provisioning %s" % payload.idempotency_key,
-            ),
-        )
+
+        if source == "FREE":
+            cursor = connection.execute(
+                """
+                UPDATE extension_inventory
+                   SET status='RESERVED',
+                       current_user=?,
+                       reserved_at=CURRENT_TIMESTAMP,
+                       updated_at=CURRENT_TIMESTAMP,
+                       note=?
+                 WHERE extension=?
+                   AND user_group=?
+                   AND status='FREE'
+                   AND current_user IS NULL
+                """,
+                (
+                    payload.username.upper(),
+                    "Reuse provisioning %s" % payload.idempotency_key,
+                    payload.extension,
+                    payload.user_group,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="FREE_RESERVATION_RACE",
+                )
+            event_type = "REUSE_RESERVE"
+            old_status = "FREE"
+        else:
+            connection.execute(
+                """
+                INSERT INTO extension_inventory
+                    (extension, user_group, status, current_user,
+                     reserved_at, updated_at, note)
+                VALUES (?, ?, 'RESERVED', ?, CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP, ?)
+                """,
+                (
+                    payload.extension,
+                    payload.user_group,
+                    payload.username.upper(),
+                    "Provisioning %s" % payload.idempotency_key,
+                ),
+            )
+            event_type = "RESERVE"
+            old_status = "UNCREATED"
+
         connection.execute(
             """
             INSERT INTO extension_inventory_events
                 (extension, user_group, event_type, old_status,
                  new_status, user_name, detail)
-            VALUES (?, ?, 'RESERVE', 'UNCREATED', 'RESERVED', ?, ?)
+            VALUES (?, ?, ?, ?, 'RESERVED', ?, ?)
             """,
             (
                 payload.extension,
                 payload.user_group,
+                event_type,
+                old_status,
                 payload.username.upper(),
-                "idempotency_key=%s" % payload.idempotency_key,
+                "idempotency_key=%s source=%s"
+                % (payload.idempotency_key, source),
             ),
         )
         connection.commit()
-        return {"replay": False}
+        return {"replay": False, "source": source}
     except HTTPException:
         raise
     except sqlite3.Error as exc:
@@ -2152,7 +2212,6 @@ def reserve_provisioning_operation(payload):
         )
     finally:
         connection.close()
-
 
 def set_provisioning_operation_status(
     idempotency_key,
@@ -2188,6 +2247,11 @@ def set_provisioning_operation_status(
 
 def finalize_inventory_in_use(payload, result):
     ensure_inventory_db()
+    event_type = (
+        "REUSE_ASSIGN"
+        if str(result.get("extension_source") or "") == "FREE"
+        else "ASSIGN"
+    )
     connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -2220,11 +2284,12 @@ def finalize_inventory_in_use(payload, result):
             INSERT INTO extension_inventory_events
                 (extension, user_group, event_type, old_status,
                  new_status, user_name, detail)
-            VALUES (?, ?, 'ASSIGN', 'RESERVED', 'IN_USE', ?, ?)
+            VALUES (?, ?, ?, 'RESERVED', 'IN_USE', ?, ?)
             """,
             (
                 payload.extension,
                 payload.user_group,
+                event_type,
                 payload.username.upper(),
                 "idempotency_key=%s" % payload.idempotency_key,
             ),
@@ -2251,27 +2316,69 @@ def finalize_inventory_in_use(payload, result):
         connection.close()
 
 
-def release_inventory_after_compensation(payload, error_text, compensation_ok):
+
+def release_inventory_after_compensation(
+    payload,
+    error_text,
+    compensation_ok,
+    reservation_source="UNCREATED",
+):
     ensure_inventory_db()
+    reservation_source = str(reservation_source or "UNCREATED").upper()
     connection = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
     try:
         connection.execute("BEGIN IMMEDIATE")
         if compensation_ok:
-            connection.execute(
-                """
-                DELETE FROM extension_inventory
-                 WHERE extension=?
-                   AND user_group=?
-                   AND status='RESERVED'
-                   AND current_user=?
-                """,
-                (
-                    payload.extension,
-                    payload.user_group,
-                    payload.username.upper(),
-                ),
-            )
-            new_status = "UNCREATED"
+            if reservation_source == "FREE":
+                cursor = connection.execute(
+                    """
+                    UPDATE extension_inventory
+                       SET status='FREE',
+                           current_user=NULL,
+                           reserved_at=NULL,
+                           updated_at=CURRENT_TIMESTAMP,
+                           note=?
+                     WHERE extension=?
+                       AND user_group=?
+                       AND status='RESERVED'
+                       AND current_user=?
+                    """,
+                    (
+                        "Reuse compensated %s" % payload.idempotency_key,
+                        payload.extension,
+                        payload.user_group,
+                        payload.username.upper(),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "FREE_COMPENSATION_INVENTORY_ROWCOUNT:%s"
+                        % cursor.rowcount
+                    )
+                new_status = "FREE"
+                event_type = "REUSE_COMPENSATE"
+            else:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM extension_inventory
+                     WHERE extension=?
+                       AND user_group=?
+                       AND status='RESERVED'
+                       AND current_user=?
+                    """,
+                    (
+                        payload.extension,
+                        payload.user_group,
+                        payload.username.upper(),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "UNCREATED_COMPENSATION_INVENTORY_ROWCOUNT:%s"
+                        % cursor.rowcount
+                    )
+                new_status = "UNCREATED"
+                event_type = "COMPENSATE"
             operation_status = "COMPENSATED"
         else:
             connection.execute(
@@ -2290,6 +2397,11 @@ def release_inventory_after_compensation(payload, error_text, compensation_ok):
                 ),
             )
             new_status = "ERROR"
+            event_type = (
+                "REUSE_COMPENSATE"
+                if reservation_source == "FREE"
+                else "COMPENSATE"
+            )
             operation_status = "ERROR"
 
         connection.execute(
@@ -2297,14 +2409,16 @@ def release_inventory_after_compensation(payload, error_text, compensation_ok):
             INSERT INTO extension_inventory_events
                 (extension, user_group, event_type, old_status,
                  new_status, user_name, detail)
-            VALUES (?, ?, 'COMPENSATE', 'RESERVED', ?, ?, ?)
+            VALUES (?, ?, ?, 'RESERVED', ?, ?, ?)
             """,
             (
                 payload.extension,
                 payload.user_group,
+                event_type,
                 new_status,
                 payload.username.upper(),
-                "idempotency_key=%s" % payload.idempotency_key,
+                "idempotency_key=%s source=%s"
+                % (payload.idempotency_key, reservation_source),
             ),
         )
         connection.execute(
@@ -2322,12 +2436,11 @@ def release_inventory_after_compensation(payload, error_text, compensation_ok):
             ),
         )
         connection.commit()
-    except sqlite3.Error:
+    except Exception:
         connection.rollback()
         raise
     finally:
         connection.close()
-
 
 def validate_created_phones(cursor, payload, identity, expected_active):
     enabled_nodes = [node for node in identity["nodes"] if node["enabled"]]
@@ -2396,12 +2509,15 @@ def validate_created_phone_alias(cursor, payload, identity):
     return row
 
 
+
 def compensate_provisioning(
     payload,
     inserted_phones,
     user_inserted,
     alias_created=False,
     alias_logins=None,
+    reused_phones=False,
+    enabled_servers=None,
 ):
     errors = []
     cfg = db_config()
@@ -2427,6 +2543,10 @@ def compensate_provisioning(
                         payload.full_name,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    errors.append(
+                        "USER_COMPENSATION_ROWCOUNT:%s" % cursor.rowcount
+                    )
             except pymysql.MySQLError as exc:
                 errors.append("USER_COMPENSATION:%s" % exc.__class__.__name__)
 
@@ -2446,31 +2566,96 @@ def compensate_provisioning(
                         str(alias_logins or ""),
                     ),
                 )
+                if cursor.rowcount != 1:
+                    errors.append(
+                        "PHONE_ALIAS_COMPENSATION_ROWCOUNT:%s"
+                        % cursor.rowcount
+                    )
             except pymysql.MySQLError as exc:
                 errors.append("PHONE_ALIAS_COMPENSATION:%s" % exc.__class__.__name__)
 
-        for item in reversed(inserted_phones):
+        if reused_phones:
             try:
-                cursor.execute(
-                    """
-                    DELETE FROM phones
-                     WHERE extension=%s
-                       AND server_ip=%s
-                       AND login=%s
-                       AND user_group=%s
-                    """,
-                    (
-                        payload.extension,
-                        item["server_ip"],
-                        item["login"],
-                        payload.user_group,
-                    ),
-                )
+                servers = list(enabled_servers or [])
+                if not servers:
+                    errors.append("REUSE_COMPENSATION_NO_SERVERS")
+                else:
+                    placeholders = ",".join(["%s"] * len(servers))
+                    cursor.execute(
+                        """
+                        UPDATE phones
+                           SET active='N',
+                               status='ACTIVE',
+                               phone_ip=NULL,
+                               computer_ip=NULL,
+                               messages=0,
+                               old_messages=0,
+                               login_user=NULL,
+                               login_pass=NULL,
+                               login_campaign=NULL,
+                               peer_status='UNKNOWN',
+                               ping_time=NULL
+                         WHERE extension=%s
+                           AND user_group=%s
+                           AND server_ip IN (%s)
+                        """ % ("%s", "%s", placeholders),
+                        tuple(
+                            [payload.extension, payload.user_group]
+                            + servers
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT COUNT(DISTINCT server_ip) AS total
+                          FROM phones
+                         WHERE extension=%s
+                           AND user_group=%s
+                           AND active='N'
+                           AND server_ip IN (%s)
+                        """ % ("%s", "%s", placeholders),
+                        tuple(
+                            [payload.extension, payload.user_group]
+                            + servers
+                        ),
+                    )
+                    row = cursor.fetchone() or {"total": 0}
+                    if int(row.get("total") or 0) != len(servers):
+                        errors.append(
+                            "REUSE_PHONE_COMPENSATION_VALIDATION:%s"
+                            % int(row.get("total") or 0)
+                        )
             except pymysql.MySQLError as exc:
                 errors.append(
-                    "PHONE_COMPENSATION:%s:%s"
-                    % (item["server_ip"], exc.__class__.__name__)
+                    "REUSE_PHONE_COMPENSATION:%s" % exc.__class__.__name__
                 )
+        else:
+            for item in reversed(inserted_phones):
+                try:
+                    cursor.execute(
+                        """
+                        DELETE FROM phones
+                         WHERE extension=%s
+                           AND server_ip=%s
+                           AND login=%s
+                           AND user_group=%s
+                        """,
+                        (
+                            payload.extension,
+                            item["server_ip"],
+                            item["login"],
+                            payload.user_group,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        errors.append(
+                            "PHONE_COMPENSATION_ROWCOUNT:%s:%s"
+                            % (item["server_ip"], cursor.rowcount)
+                        )
+                except pymysql.MySQLError as exc:
+                    errors.append(
+                        "PHONE_COMPENSATION:%s:%s"
+                        % (item["server_ip"], exc.__class__.__name__)
+                    )
     except Exception as exc:
         errors.append("COMPENSATION_CONNECTION:%s" % exc.__class__.__name__)
     finally:
@@ -2502,8 +2687,6 @@ def execute_provisioning(payload, expose_credentials=False):
             },
         )
 
-    # Resolver credenciales antes de reservar para no dejar RESERVED
-    # si la configuración server-side está incompleta.
     agent_password = resolve_agent_password(
         payload.user_group,
         payload.agent_pass,
@@ -2515,16 +2698,41 @@ def execute_provisioning(payload, expose_credentials=False):
         replay_result["credentials_available"] = False
         return replay_result
 
-    # Revalidar después de reservar para cerrar la ventana preview -> ejecución.
-    recheck = provisioning_write_plan(
-        payload.user_group,
-        payload.username,
-        payload.full_name,
-        payload.extension,
-    )
+    reservation_source = str(
+        reservation.get("source") or "UNCREATED"
+    ).upper()
+
+    # Revalidate after the SQLite reservation. FREE is now RESERVED, so its
+    # recheck explicitly accepts only the reservation held by this username.
+    if reservation_source == "FREE":
+        reuse_check = free_reuse_precheck(
+            payload.user_group,
+            payload.extension,
+            expected_reserved_user=payload.username.upper(),
+        )
+        recheck = free_reuse_write_plan(
+            payload.user_group,
+            payload.username,
+            payload.full_name,
+            payload.extension,
+            reuse_check,
+        )
+    else:
+        recheck = provisioning_write_plan(
+            payload.user_group,
+            payload.username,
+            payload.full_name,
+            payload.extension,
+        )
+
     if recheck["status"] != "READY":
         error_text = "REVALIDATION_BLOCKED:%s" % ",".join(recheck["blockers"])
-        release_inventory_after_compensation(payload, error_text, True)
+        release_inventory_after_compensation(
+            payload,
+            error_text,
+            True,
+            reservation_source=reservation_source,
+        )
         raise HTTPException(
             status_code=409,
             detail={
@@ -2534,6 +2742,12 @@ def execute_provisioning(payload, expose_credentials=False):
         )
 
     identity = canonical_phone_plan(payload.user_group, payload.extension)
+    enabled_servers = [
+        str(node["server_ip"])
+        for node in identity["nodes"]
+        if node["enabled"]
+    ]
+    reused_phones = reservation_source == "FREE"
 
     inserted_phones = []
     alias_created = False
@@ -2548,28 +2762,54 @@ def execute_provisioning(payload, expose_credentials=False):
         connection = pymysql.connect(**cfg)
         cursor = connection.cursor()
 
-        for node_plan in recheck["phones_plan"]:
-            if node_plan.get("status") != "READY":
-                continue
-            params = [
-                item["value"]
-                for item in node_plan["safe_parameters_in_order"]
-            ]
-            cursor.execute(node_plan["sql_template"], tuple(params))
-            if cursor.rowcount != 1:
-                raise RuntimeError(
-                    "PHONE_INSERT_ROWCOUNT:%s:%s"
-                    % (node_plan["server_ip"], cursor.rowcount)
-                )
-            target_login = None
-            for changed in node_plan["changed_fields"]:
-                if changed["field"] == "login":
-                    target_login = changed["to"]
-                    break
-            inserted_phones.append({
-                "server_ip": node_plan["server_ip"],
-                "login": target_login,
-            })
+        if reused_phones:
+            placeholders = ",".join(["%s"] * len(enabled_servers))
+            cursor.execute(
+                """
+                UPDATE phones
+                   SET active='N',
+                       status='ACTIVE',
+                       phone_ip=NULL,
+                       computer_ip=NULL,
+                       messages=0,
+                       old_messages=0,
+                       login_user=NULL,
+                       login_pass=NULL,
+                       login_campaign=NULL,
+                       peer_status='UNKNOWN',
+                       ping_time=NULL
+                 WHERE extension=%s
+                   AND user_group=%s
+                   AND server_ip IN (%s)
+                """ % ("%s", "%s", placeholders),
+                tuple(
+                    [payload.extension, payload.user_group]
+                    + enabled_servers
+                ),
+            )
+        else:
+            for node_plan in recheck["phones_plan"]:
+                if node_plan.get("status") != "READY":
+                    continue
+                params = [
+                    item["value"]
+                    for item in node_plan["safe_parameters_in_order"]
+                ]
+                cursor.execute(node_plan["sql_template"], tuple(params))
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "PHONE_INSERT_ROWCOUNT:%s:%s"
+                        % (node_plan["server_ip"], cursor.rowcount)
+                    )
+                target_login = None
+                for changed in node_plan["changed_fields"]:
+                    if changed["field"] == "login":
+                        target_login = changed["to"]
+                        break
+                inserted_phones.append({
+                    "server_ip": node_plan["server_ip"],
+                    "login": target_login,
+                })
 
         validate_created_phones(
             cursor,
@@ -2620,11 +2860,6 @@ def execute_provisioning(payload, expose_credentials=False):
         if str(user_row.get("active") or "") != "N":
             raise RuntimeError("USER_ACTIVE_STAGE_MISMATCH")
 
-        enabled_servers = [
-            node["server_ip"]
-            for node in identity["nodes"]
-            if node["enabled"]
-        ]
         placeholders = ",".join(["%s"] * len(enabled_servers))
         activate_sql = (
             "UPDATE phones SET active='Y' "
@@ -2687,6 +2922,17 @@ def execute_provisioning(payload, expose_credentials=False):
             "username": payload.username.upper(),
             "full_name": payload.full_name,
             "extension": payload.extension,
+            "extension_source": reservation_source,
+            "extension_action": (
+                "REUSE_EXISTING"
+                if reused_phones
+                else "CREATE_PHONES"
+            ),
+            "previous_user": (
+                str(recheck.get("reuse_precheck", {}).get("previous_user") or "")
+                if reused_phones
+                else ""
+            ),
             "required_nodes": len(final_rows),
             "phones": [
                 {
@@ -2703,11 +2949,13 @@ def execute_provisioning(payload, expose_credentials=False):
                 "logins_list": str(final_alias.get("logins_list") or ""),
                 "user_group": str(final_alias.get("user_group") or ""),
             },
-            "rollback_strategy": "COMPENSATING_DELETE_UPDATE",
+            "rollback_strategy": (
+                "COMPENSATING_RESTORE_FREE"
+                if reused_phones
+                else "COMPENSATING_DELETE_UPDATE"
+            ),
         }
 
-        # Persistir únicamente el resultado no sensible.
-        # La contraseña nunca entra a result_json, SQLite ni auth_audit.
         finalize_inventory_in_use(payload, result)
 
         if expose_credentials:
@@ -2732,6 +2980,8 @@ def execute_provisioning(payload, expose_credentials=False):
             user_inserted,
             alias_created=alias_created,
             alias_logins=alias_logins,
+            reused_phones=reused_phones,
+            enabled_servers=enabled_servers,
         )
         compensation_ok = not compensation_errors
         error_text = "%s:%s" % (exc.__class__.__name__, str(exc))
@@ -2743,6 +2993,7 @@ def execute_provisioning(payload, expose_credentials=False):
                 payload,
                 error_text,
                 compensation_ok,
+                reservation_source=reservation_source,
             )
         except Exception:
             compensation_ok = False
@@ -2752,13 +3003,13 @@ def execute_provisioning(payload, expose_credentials=False):
             detail={
                 "code": "PROVISIONING_FAILED",
                 "compensation_ok": compensation_ok,
+                "extension_source": reservation_source,
                 "error": error_text,
             },
         )
     finally:
         if connection:
             connection.close()
-
 
 def require_managed_group(user_group):
     managed = set(load_managed_groups())
