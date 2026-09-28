@@ -886,6 +886,9 @@ def free_reuse_precheck(user_group, extension, expected_reserved_user=None):
     blockers = []
     warnings = []
 
+    if status == "FREE" and inventory.get("current_user"):
+        blockers.append("FREE_INVENTORY_CURRENT_USER_PRESENT")
+
     if str(inventory.get("user_group") or "") != user_group:
         blockers.append("FREE_INVENTORY_GROUP_MISMATCH")
 
@@ -1071,6 +1074,8 @@ def free_reuse_write_plan(user_group, username, full_name, extension, reuse_chec
 
     blockers = list(reuse_check.get("blockers") or [])
     warnings = list(reuse_check.get("warnings") or [])
+    if not reuse_check.get("is_free_reuse"):
+        blockers.append("FREE_REUSE_STATE_INVALID")
 
     if not username or len(username) > USERNAME_MAX_LENGTH:
         blockers.append("INVALID_USERNAME_LENGTH")
@@ -2704,44 +2709,70 @@ def execute_provisioning(payload, expose_credentials=False):
 
     # Revalidate after the SQLite reservation. FREE is now RESERVED, so its
     # recheck explicitly accepts only the reservation held by this username.
-    if reservation_source == "FREE":
-        reuse_check = free_reuse_precheck(
-            payload.user_group,
-            payload.extension,
-            expected_reserved_user=payload.username.upper(),
-        )
-        recheck = free_reuse_write_plan(
-            payload.user_group,
-            payload.username,
-            payload.full_name,
-            payload.extension,
-            reuse_check,
-        )
-    else:
-        recheck = provisioning_write_plan(
-            payload.user_group,
-            payload.username,
-            payload.full_name,
-            payload.extension,
-        )
+    try:
+        if reservation_source == "FREE":
+            reuse_check = free_reuse_precheck(
+                payload.user_group,
+                payload.extension,
+                expected_reserved_user=payload.username.upper(),
+            )
+            recheck = free_reuse_write_plan(
+                payload.user_group,
+                payload.username,
+                payload.full_name,
+                payload.extension,
+                reuse_check,
+            )
+        else:
+            recheck = provisioning_write_plan(
+                payload.user_group,
+                payload.username,
+                payload.full_name,
+                payload.extension,
+            )
 
-    if recheck["status"] != "READY":
-        error_text = "REVALIDATION_BLOCKED:%s" % ",".join(recheck["blockers"])
-        release_inventory_after_compensation(
-            payload,
-            error_text,
-            True,
-            reservation_source=reservation_source,
+        if recheck["status"] != "READY":
+            error_text = "REVALIDATION_BLOCKED:%s" % ",".join(
+                recheck["blockers"]
+            )
+            release_inventory_after_compensation(
+                payload,
+                error_text,
+                True,
+                reservation_source=reservation_source,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "WRITE_REVALIDATION_BLOCKED",
+                    "blockers": recheck["blockers"],
+                },
+            )
+
+        identity = canonical_phone_plan(payload.user_group, payload.extension)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        error_text = "PREWRITE_REVALIDATION_ERROR:%s:%s" % (
+            exc.__class__.__name__,
+            str(exc),
         )
+        try:
+            release_inventory_after_compensation(
+                payload,
+                error_text,
+                True,
+                reservation_source=reservation_source,
+            )
+        except Exception:
+            pass
         raise HTTPException(
-            status_code=409,
+            status_code=500,
             detail={
-                "code": "WRITE_REVALIDATION_BLOCKED",
-                "blockers": recheck["blockers"],
+                "code": "PREWRITE_REVALIDATION_FAILED",
+                "error": error_text[:500],
             },
         )
-
-    identity = canonical_phone_plan(payload.user_group, payload.extension)
     enabled_servers = [
         str(node["server_ip"])
         for node in identity["nodes"]
@@ -3334,7 +3365,13 @@ def extension_inventory_snapshot(user_group):
 
     free_candidates = [
         row["extension"] for row in positions
-        if row["status"] == "FREE" and row["topology_complete"]
+        if (
+            row["status"] == "FREE"
+            and row["topology_complete"]
+            and row["server_count"] == row["expected_enabled_server_count"]
+            and row["active_rows"] == 0
+            and row["group_alignment"] == "ALIGNED"
+        )
     ]
     uncreated_candidates = [
         row["extension"] for row in positions if row["status"] == "UNCREATED"
