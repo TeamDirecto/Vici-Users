@@ -483,7 +483,7 @@
       user.status==='AVAILABLE' &&
       user.username &&
       user.extension &&
-      user.extension_source!=='FREE'
+      (user.extension_source==='UNCREATED'||user.extension_source==='FREE')
     );
     return users.length===previewPayload.requested?users:[];
   }
@@ -516,10 +516,13 @@
         $('createNote').textContent='Por seguridad el portal permite hasta '+MAX_PORTAL_BATCH+' altas por lote. Divide la solicitud y vuelve a previsualizar.';
       }else if(previewPayload.conflicts!==0||previewPayload.available!==previewPayload.requested){
         $('createNote').textContent='El lote contiene conflictos. Todas las filas deben quedar disponibles antes de crear.';
-      }else if(previewPayload.users&&previewPayload.users.some(u=>u.extension_source==='FREE')){
-        $('createNote').textContent='El lote contiene una extensión FREE. El reciclaje sigue bloqueado; usa únicamente UNCREATED.';
       }else if(candidates.length){
-        $('createNote').textContent='Lote listo: '+candidates.length+' usuario(s) + extensión(es) · '+(alloc.required_nodes||0)+' nodo(s) por extensión.';
+        const recycled=candidates.filter(u=>u.extension_source==='FREE').length;
+        const fresh=candidates.length-recycled;
+        const sourceText=recycled
+          ? recycled+' reciclada(s) FREE'+(fresh?' + '+fresh+' nueva(s) UNCREATED':'')
+          : fresh+' nueva(s) UNCREATED';
+        $('createNote').textContent='Lote listo: '+candidates.length+' usuario(s) + extensión(es) · '+sourceText+' · '+(alloc.required_nodes||0)+' nodo(s) por extensión.';
       }else{
         $('createNote').textContent='La previsualización no cumple las condiciones para escritura.';
       }
@@ -559,7 +562,11 @@
       ? first.full_name
       : 'Lote de '+pendingProvisioning.length+' altas';
     $('confirmNodes').textContent=String(requiredNodes);
-    $('confirmSource').textContent='UNCREATED';
+    const recycledCount=pendingProvisioning.filter(item=>item.extension_source==='FREE').length;
+    const freshCount=pendingProvisioning.length-recycledCount;
+    $('confirmSource').textContent=recycledCount&&freshCount
+      ? 'MIXTO · '+recycledCount+' FREE / '+freshCount+' UNCREATED'
+      : (recycledCount?'FREE · REUSE_EXISTING':'UNCREATED · CREATE_PHONES');
     $('confirmPhrase').value='';
     $('confirmCreateBtn').disabled=true;
     $('confirmError').classList.add('hidden');
