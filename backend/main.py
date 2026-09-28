@@ -45,6 +45,9 @@ PORTAL_WRITE_ENABLED = os.getenv(
     "VICI_USERS_PORTAL_WRITE_ENABLED", "false"
 ).lower() in {"1", "true", "yes", "y"}
 USERNAME_MAX_LENGTH = int(os.getenv("VICI_USERS_USERNAME_MAX_LENGTH", "20"))
+FREE_REUSE_COOLDOWN_HOURS = int(
+    os.getenv("VICI_USERS_FREE_REUSE_COOLDOWN_HOURS", "24")
+)
 SUPERVISOR_TEMPLATE_USER = os.getenv("VICI_USERS_SUPERVISOR_TEMPLATE_USER", "ADMINSANT02").strip()
 SUPERVISOR_SERVER_IP = os.getenv("VICI_USERS_SUPERVISOR_SERVER_IP", "172.20.21.90").strip()
 SUPERVISOR_EXTENSION_START = int(os.getenv("VICI_USERS_SUPERVISOR_EXTENSION_START", "1064"))
@@ -132,7 +135,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.20.2-supervisor-template-split")
+app = FastAPI(title="Vici-Users API", version="0.21.0-free-reuse")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -795,6 +798,8 @@ def phone_provisioning_dry_run(user_group, extension):
         "mode": "DRY_RUN",
         "write_performed": False,
         "status": status,
+        "extension_source": "UNCREATED",
+        "extension_action": "CREATE_PHONES",
         "user_group": user_group,
         "extension": extension_text,
         "identity_policy": identity["identity_policy"],
@@ -817,11 +822,437 @@ def phone_provisioning_dry_run(user_group, extension):
     }
 
 
+def free_reuse_precheck(user_group, extension, expected_reserved_user=None):
+    """Fail-closed validation for reusing an extension already managed as FREE."""
+    require_provisioning_group(user_group)
+    extension_text = str(extension or "").strip()
+    identity = canonical_phone_plan(user_group, extension_text)
+    enabled_nodes = [node for node in identity["nodes"] if node["enabled"]]
+    enabled_by_server = dict(
+        (str(node["server_ip"]), node)
+        for node in enabled_nodes
+    )
+    enabled_servers = set(enabled_by_server.keys())
+
+    ensure_inventory_db()
+    sqlite_db = sqlite3.connect(str(INVENTORY_DB_FILE), timeout=5)
+    sqlite_db.row_factory = sqlite3.Row
+    try:
+        inventory = sqlite_db.execute(
+            """
+            SELECT extension, user_group, status, current_user, previous_user,
+                   reserved_at, assigned_at, released_at, updated_at, note
+              FROM extension_inventory
+             WHERE extension=?
+             LIMIT 1
+            """,
+            (extension_text,),
+        ).fetchone()
+    finally:
+        sqlite_db.close()
+
+    if not inventory:
+        return {
+            "is_free_reuse": False,
+            "extension": extension_text,
+            "blockers": [],
+            "warnings": [],
+        }
+
+    inventory = dict(inventory)
+    status = str(inventory.get("status") or "").upper()
+    expected_reserved_user = (
+        str(expected_reserved_user or "").strip().upper() or None
+    )
+
+    valid_inventory_state = status == "FREE"
+    if expected_reserved_user is not None:
+        valid_inventory_state = (
+            status == "RESERVED"
+            and str(inventory.get("current_user") or "").upper()
+                == expected_reserved_user
+            and bool(inventory.get("released_at"))
+        )
+
+    if not valid_inventory_state:
+        return {
+            "is_free_reuse": False,
+            "extension": extension_text,
+            "inventory_status": status,
+            "blockers": [],
+            "warnings": [],
+        }
+
+    blockers = []
+    warnings = []
+
+    if str(inventory.get("user_group") or "") != user_group:
+        blockers.append("FREE_INVENTORY_GROUP_MISMATCH")
+
+    released_at = inventory.get("released_at")
+    released_age_hours = None
+    if not released_at:
+        blockers.append("FREE_RELEASE_TIMESTAMP_MISSING")
+    else:
+        try:
+            released_dt = datetime.strptime(
+                str(released_at),
+                "%Y-%m-%d %H:%M:%S",
+            )
+            released_age_hours = (
+                datetime.utcnow() - released_dt
+            ).total_seconds() / 3600.0
+            if released_age_hours < FREE_REUSE_COOLDOWN_HOURS:
+                blockers.append("FREE_RELEASE_COOLDOWN")
+        except (TypeError, ValueError):
+            blockers.append("FREE_RELEASE_TIMESTAMP_INVALID")
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT extension, server_ip, login, dialplan_number, `pass`,
+                   active, status, user_group
+              FROM phones
+             WHERE extension=%s
+             ORDER BY server_ip
+            """,
+            (extension_text,),
+        )
+        phone_rows = cursor.fetchall()
+
+        phone_servers = set(
+            str(row.get("server_ip") or "").strip()
+            for row in phone_rows
+            if str(row.get("server_ip") or "").strip()
+        )
+
+        if len(phone_rows) != len(enabled_nodes):
+            blockers.append(
+                "FREE_PHONE_COUNT_MISMATCH:%d:%d"
+                % (len(phone_rows), len(enabled_nodes))
+            )
+
+        missing_servers = sorted(enabled_servers.difference(phone_servers))
+        extra_servers = sorted(phone_servers.difference(enabled_servers))
+        if missing_servers:
+            blockers.append(
+                "FREE_MISSING_NODE:%s" % ",".join(missing_servers)
+            )
+        if extra_servers:
+            blockers.append(
+                "FREE_EXTRA_NODE:%s" % ",".join(extra_servers)
+            )
+
+        for row in phone_rows:
+            server_ip = str(row.get("server_ip") or "")
+            target = enabled_by_server.get(server_ip)
+            if not target:
+                continue
+            if str(row.get("user_group") or "") != user_group:
+                blockers.append("FREE_PHONE_GROUP_MISMATCH:%s" % server_ip)
+            if str(row.get("active") or "").upper() != "N":
+                blockers.append("FREE_PHONE_ACTIVE:%s" % server_ip)
+            if str(row.get("status") or "").upper() != "ACTIVE":
+                blockers.append("FREE_PHONE_STATUS_MISMATCH:%s" % server_ip)
+            if str(row.get("login") or "") != str(target["login"]):
+                blockers.append("FREE_PHONE_LOGIN_MISMATCH:%s" % server_ip)
+            if str(row.get("dialplan_number") or "") != str(target["dialplan_number"]):
+                blockers.append("FREE_PHONE_DIALPLAN_MISMATCH:%s" % server_ip)
+            if str(row.get("pass") or "") != extension_text:
+                blockers.append("FREE_PHONE_PASS_MISMATCH:%s" % server_ip)
+
+        cursor.execute(
+            """
+            SELECT alias_id, alias_name, logins_list, user_group
+              FROM phones_alias
+             WHERE alias_id=%s
+             LIMIT 1
+            """,
+            (extension_text,),
+        )
+        alias_row = cursor.fetchone()
+        if alias_row:
+            blockers.append("FREE_PHONE_ALIAS_PRESENT")
+
+        cursor.execute(
+            """
+            SELECT user
+              FROM vicidial_users
+             WHERE active='Y'
+               AND phone_login=%s
+             LIMIT 10
+            """,
+            (extension_text,),
+        )
+        active_users = [
+            str(row.get("user") or "")
+            for row in cursor.fetchall()
+        ]
+        if active_users:
+            blockers.append(
+                "FREE_ACTIVE_USER_PHONE_LOGIN:%s"
+                % ",".join(active_users)
+            )
+
+        cursor.execute(
+            """
+            SELECT user, extension, server_ip
+              FROM vicidial_live_agents
+             WHERE extension IN (%s,%s)
+             LIMIT 10
+            """,
+            (extension_text, "SIP/%s" % extension_text),
+        )
+        live_agents = [
+            str(row.get("user") or "")
+            for row in cursor.fetchall()
+        ]
+        if live_agents:
+            blockers.append(
+                "FREE_LIVE_AGENT:%s" % ",".join(live_agents)
+            )
+
+        cursor.execute(
+            """
+            SELECT user, event_date, server_ip,
+                   TIMESTAMPDIFF(HOUR, event_date, NOW()) AS age_hours
+              FROM vicidial_user_log
+             WHERE extension IN (%s,%s)
+             ORDER BY event_epoch DESC
+             LIMIT 1
+            """,
+            (extension_text, "SIP/%s" % extension_text),
+        )
+        last_use = cursor.fetchone()
+
+    last_use_age_hours = None
+    if last_use and last_use.get("age_hours") is not None:
+        try:
+            last_use_age_hours = float(last_use.get("age_hours"))
+        except (TypeError, ValueError):
+            last_use_age_hours = None
+        if (
+            last_use_age_hours is not None
+            and last_use_age_hours < FREE_REUSE_COOLDOWN_HOURS
+        ):
+            blockers.append("FREE_LAST_USE_COOLDOWN")
+
+    unique_blockers = []
+    for blocker in blockers:
+        if blocker not in unique_blockers:
+            unique_blockers.append(blocker)
+
+    return {
+        "is_free_reuse": True,
+        "status": "READY" if not unique_blockers else "BLOCKED",
+        "extension": extension_text,
+        "user_group": user_group,
+        "inventory_status": status,
+        "previous_user": str(inventory.get("previous_user") or ""),
+        "released_at": str(released_at or ""),
+        "released_age_hours": released_age_hours,
+        "last_user": str((last_use or {}).get("user") or ""),
+        "last_use_at": (
+            str((last_use or {}).get("event_date") or "")
+            if last_use else ""
+        ),
+        "last_use_age_hours": last_use_age_hours,
+        "required_nodes": len(enabled_nodes),
+        "phone_rows": phone_rows,
+        "blockers": unique_blockers,
+        "warnings": warnings,
+    }
+
+
+def free_reuse_write_plan(user_group, username, full_name, extension, reuse_check):
+    username = str(username or "").strip().upper()
+    full_name = str(full_name or "").strip()
+    extension_text = str(extension or "").strip()
+
+    blockers = list(reuse_check.get("blockers") or [])
+    warnings = list(reuse_check.get("warnings") or [])
+
+    if not username or len(username) > USERNAME_MAX_LENGTH:
+        blockers.append("INVALID_USERNAME_LENGTH")
+    elif not all(ch.isalnum() or ch == "_" for ch in username):
+        blockers.append("INVALID_USERNAME_CHARACTERS")
+    if not full_name:
+        blockers.append("FULL_NAME_REQUIRED")
+
+    templates = load_group_templates()
+    template_user = templates.get(user_group)
+    if not template_user:
+        blockers.append("USER_TEMPLATE_NOT_CONFIGURED")
+    if user_group not in load_group_defaults():
+        blockers.append("DEFAULT_PASSWORD_NOT_CONFIGURED")
+
+    identity = canonical_phone_plan(user_group, extension_text)
+    alias_expected = expected_phone_alias(identity)
+    enabled_servers = [
+        str(node["server_ip"])
+        for node in identity["nodes"]
+        if node["enabled"]
+    ]
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT user FROM vicidial_users WHERE user=%s LIMIT 1",
+            (username,),
+        )
+        if cursor.fetchone():
+            blockers.append("TARGET_USER_ALREADY_EXISTS")
+
+        if template_user:
+            cursor.execute(
+                """
+                SELECT user
+                  FROM vicidial_users
+                 WHERE user=%s
+                   AND user_group=%s
+                 LIMIT 1
+                """,
+                (template_user, user_group),
+            )
+            if not cursor.fetchone():
+                blockers.append("USER_TEMPLATE_ROW_MISSING")
+
+        cursor.execute("SHOW COLUMNS FROM vicidial_users")
+        user_schema = set(row["Field"] for row in cursor.fetchall())
+        if any(field not in user_schema for field in USER_CLONE_FIELDS):
+            blockers.append("USER_SCHEMA_ALLOWLIST_MISMATCH")
+
+    user_columns = [
+        "user", "pass", "full_name", "user_level", "user_group", "active"
+    ] + list(USER_CLONE_FIELDS)
+    user_columns_sql = ", ".join("`%s`" % field for field in user_columns)
+    user_select_sql = ", ".join(
+        ["%s", "%s", "%s", "%s", "%s", "%s"]
+        + ["`%s`" % field for field in USER_CLONE_FIELDS]
+    )
+    user_insert_sql = (
+        "INSERT INTO vicidial_users (%s) "
+        "SELECT %s FROM vicidial_users "
+        "WHERE user=%%s AND user_group=%%s LIMIT 1"
+        % (user_columns_sql, user_select_sql)
+    )
+
+    unique_blockers = []
+    for blocker in blockers:
+        if blocker not in unique_blockers:
+            unique_blockers.append(blocker)
+
+    server_placeholders = ",".join(["%s"] * len(enabled_servers))
+    activate_phones_sql = (
+        "UPDATE phones SET active='Y' "
+        "WHERE extension=%s AND user_group=%s "
+        "AND server_ip IN (%s)" % ("%s", "%s", server_placeholders)
+    )
+
+    return {
+        "mode": "DRY_RUN_WRITE_PLAN",
+        "write_performed": False,
+        "create_enabled": CREATE_ENABLED,
+        "status": "READY" if not unique_blockers else "BLOCKED",
+        "extension_source": "FREE",
+        "extension_action": "REUSE_EXISTING",
+        "user_group": user_group,
+        "username": username,
+        "full_name": full_name,
+        "extension": extension_text,
+        "storage_engines": {
+            "phones": "MyISAM",
+            "phones_alias": "MyISAM",
+            "vicidial_users": "MyISAM",
+        },
+        "rollback_strategy": "COMPENSATING_RESTORE_FREE",
+        "reuse_precheck": reuse_check,
+        "user_plan": {
+            "source_user": template_user,
+            "target_user": username,
+            "clone_fields_count": len(USER_CLONE_FIELDS),
+            "identity_overrides": {
+                "user": username,
+                "pass": "<SERVER_SIDE_GROUP_PASSWORD>",
+                "full_name": full_name,
+                "user_level": 1,
+                "user_group": user_group,
+                "active": "N",
+            },
+            "sql_template": user_insert_sql,
+            "safe_parameters_in_order": [
+                username,
+                "<SERVER_SIDE_GROUP_PASSWORD>",
+                full_name,
+                1,
+                user_group,
+                "N",
+                template_user,
+                user_group,
+            ],
+            "final_activation_sql": (
+                "UPDATE vicidial_users SET active='Y' "
+                "WHERE user=%s AND user_group=%s"
+            ),
+        },
+        "phones_plan": [],
+        "phone_alias_plan": {
+            "alias_id": alias_expected["alias_id"],
+            "alias_name": alias_expected["alias_name"],
+            "logins_list": alias_expected["logins_list"],
+            "user_group": alias_expected["user_group"],
+            "sql_template": (
+                "INSERT INTO phones_alias "
+                "(alias_id, alias_name, logins_list, user_group) "
+                "VALUES (%s, %s, %s, %s)"
+            ),
+            "safe_parameters_in_order": [
+                alias_expected["alias_id"],
+                alias_expected["alias_name"],
+                alias_expected["logins_list"],
+                alias_expected["user_group"],
+            ],
+        },
+        "operation_order": [
+            "REVALIDATE_FREE_EXTENSION",
+            "RESERVE_FREE_EXTENSION",
+            "RESET_EXISTING_PHONE_RUNTIME_STATE",
+            "VALIDATE_EXISTING_PHONES_ACTIVE_N",
+            "INSERT_PHONE_ALIAS",
+            "VALIDATE_PHONE_ALIAS",
+            "INSERT_USER_AS_ACTIVE_N",
+            "VALIDATE_USER",
+            "ACTIVATE_EXISTING_PHONES",
+            "ACTIVATE_USER",
+            "VALIDATE_FINAL_USER_PHONES_AND_ALIAS",
+            "MARK_EXTENSION_IN_USE",
+        ],
+        "activation_sql": {
+            "phones": activate_phones_sql,
+            "user": (
+                "UPDATE vicidial_users SET active='Y' "
+                "WHERE user=%s AND user_group=%s"
+            ),
+        },
+        "blockers": unique_blockers,
+        "warnings": warnings,
+    }
+
+
 def provisioning_write_plan(user_group, username, full_name, extension):
     require_provisioning_group(user_group)
     username = str(username or "").strip().upper()
     full_name = str(full_name or "").strip()
     extension_text = str(extension or "").strip()
+
+    reuse_check = free_reuse_precheck(user_group, extension_text)
+    if reuse_check.get("is_free_reuse"):
+        return free_reuse_write_plan(
+            user_group,
+            username,
+            full_name,
+            extension_text,
+            reuse_check,
+        )
 
     blockers = []
     warnings = []
@@ -1217,7 +1648,7 @@ def extension_candidate_pool(user_group):
     with db_cursor() as cursor:
         cursor.execute(
             """
-            SELECT extension, server_ip, active, user_group
+            SELECT extension, server_ip, active, status, user_group
               FROM phones
              WHERE extension IN (%s)
              ORDER BY extension, server_ip
@@ -1261,7 +1692,36 @@ def extension_candidate_pool(user_group):
                 str(row.get("user_group") or "").strip() == user_group
                 for row in rows
             )
-            if enabled_servers.issubset(servers) and groups_aligned:
+            phones_inactive = all(
+                str(row.get("active") or "").upper() == "N"
+                for row in rows
+            )
+            statuses_active = all(
+                str(row.get("status") or "").upper() == "ACTIVE"
+                for row in rows
+            )
+            cooldown_ok = False
+            try:
+                released_dt = datetime.strptime(
+                    str(released_at),
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                cooldown_ok = (
+                    (datetime.utcnow() - released_dt).total_seconds() / 3600.0
+                    >= FREE_REUSE_COOLDOWN_HOURS
+                )
+            except (TypeError, ValueError):
+                cooldown_ok = False
+
+            if (
+                len(rows) == len(enabled_servers)
+                and servers == enabled_servers
+                and groups_aligned
+                and phones_inactive
+                and statuses_active
+                and extension not in alias_ids
+                and cooldown_ok
+            ):
                 free_candidates.append({
                     "extension": extension,
                     "source": "FREE",
@@ -1385,12 +1845,26 @@ def preview_extension_allocations(user_group, requested, allow_free=True):
 
         extension = candidate["extension"]
         if candidate["source"] == "FREE":
+            reuse_check = free_reuse_precheck(user_group, extension)
+            reasons = list(reuse_check.get("blockers") or [])
+            if reasons:
+                rejected.append({
+                    "extension": extension,
+                    "source": "FREE",
+                    "status": "BLOCKED",
+                    "reasons": reasons,
+                })
+                continue
             allocations.append({
                 "extension": extension,
                 "source": "FREE",
                 "action": "REUSE_EXISTING",
                 "status": "READY",
                 "released_at": candidate["released_at"],
+                "previous_user": reuse_check.get("previous_user"),
+                "last_user": reuse_check.get("last_user"),
+                "last_use_at": reuse_check.get("last_use_at"),
+                "cooldown_hours": FREE_REUSE_COOLDOWN_HOURS,
             })
             continue
 
@@ -3033,6 +3507,7 @@ def health():
         "portal_write_enabled": PORTAL_WRITE_ENABLED,
         "auth_session_ttl": AUTH_SESSION_TTL,
         "username_max_length": USERNAME_MAX_LENGTH,
+        "free_reuse_cooldown_hours": FREE_REUSE_COOLDOWN_HOURS,
         "supervisor_template_user": SUPERVISOR_TEMPLATE_USER,
         "supervisor_server_ip": SUPERVISOR_SERVER_IP,
         "supervisor_extension_start": SUPERVISOR_EXTENSION_START,
@@ -5647,7 +6122,7 @@ def preview_users(payload: PreviewRequest, request: Request):
     extension_preview = preview_extension_allocations(
         payload.user_group,
         len(available_rows),
-        allow_free=False,
+        allow_free=True,
     )
     allocations = list(extension_preview["allocations"])
 
