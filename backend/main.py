@@ -135,7 +135,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.21.0-free-reuse")
+app = FastAPI(title="Vici-Users API", version="0.21.1-agent-phone-binding")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -1125,13 +1125,16 @@ def free_reuse_write_plan(user_group, username, full_name, extension, reuse_chec
         user_schema = set(row["Field"] for row in cursor.fetchall())
         if any(field not in user_schema for field in USER_CLONE_FIELDS):
             blockers.append("USER_SCHEMA_ALLOWLIST_MISMATCH")
+        if "phone_login" not in user_schema or "phone_pass" not in user_schema:
+            blockers.append("USER_PHONE_BIND_SCHEMA_MISMATCH")
 
     user_columns = [
-        "user", "pass", "full_name", "user_level", "user_group", "active"
+        "user", "pass", "full_name", "user_level", "user_group", "active",
+        "phone_login", "phone_pass",
     ] + list(USER_CLONE_FIELDS)
     user_columns_sql = ", ".join("`%s`" % field for field in user_columns)
     user_select_sql = ", ".join(
-        ["%s", "%s", "%s", "%s", "%s", "%s"]
+        ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s"]
         + ["`%s`" % field for field in USER_CLONE_FIELDS]
     )
     user_insert_sql = (
@@ -1182,6 +1185,8 @@ def free_reuse_write_plan(user_group, username, full_name, extension, reuse_chec
                 "user_level": 1,
                 "user_group": user_group,
                 "active": "N",
+                "phone_login": extension_text,
+                "phone_pass": extension_text,
             },
             "sql_template": user_insert_sql,
             "safe_parameters_in_order": [
@@ -1191,6 +1196,8 @@ def free_reuse_write_plan(user_group, username, full_name, extension, reuse_chec
                 1,
                 user_group,
                 "N",
+                extension_text,
+                extension_text,
                 template_user,
                 user_group,
             ],
@@ -1323,6 +1330,8 @@ def provisioning_write_plan(user_group, username, full_name, extension):
         ]
         if missing_user_fields:
             blockers.append("USER_SCHEMA_ALLOWLIST_MISMATCH")
+        if "phone_login" not in user_schema or "phone_pass" not in user_schema:
+            blockers.append("USER_PHONE_BIND_SCHEMA_MISMATCH")
 
         cursor.execute("SHOW COLUMNS FROM phones")
         phone_columns = [row["Field"] for row in cursor.fetchall()]
@@ -1493,11 +1502,12 @@ def provisioning_write_plan(user_group, username, full_name, extension):
             })
 
     user_columns = [
-        "user", "pass", "full_name", "user_level", "user_group", "active"
+        "user", "pass", "full_name", "user_level", "user_group", "active",
+        "phone_login", "phone_pass",
     ] + list(USER_CLONE_FIELDS)
     user_columns_sql = ", ".join("`%s`" % field for field in user_columns)
     user_select_sql = ", ".join(
-        ["%s", "%s", "%s", "%s", "%s", "%s"]
+        ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s"]
         + ["`%s`" % field for field in USER_CLONE_FIELDS]
     )
     user_insert_sql = (
@@ -1566,6 +1576,8 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                 "user_level": 1,
                 "user_group": user_group,
                 "active": "N",
+                "phone_login": extension_text,
+                "phone_pass": extension_text,
             },
             "sql_template": user_insert_sql,
             "safe_parameters_in_order": [
@@ -1575,6 +1587,8 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                 1,
                 user_group,
                 "N",
+                extension_text,
+                extension_text,
                 template_user,
                 user_group,
             ],
@@ -2872,7 +2886,8 @@ def execute_provisioning(payload, expose_credentials=False):
 
         cursor.execute(
             """
-            SELECT user, full_name, user_level, user_group, active
+            SELECT user, full_name, user_level, user_group, active,
+                   phone_login, phone_pass
               FROM vicidial_users
              WHERE user=%s
              LIMIT 1
@@ -2890,6 +2905,10 @@ def execute_provisioning(payload, expose_credentials=False):
             raise RuntimeError("USER_LEVEL_MISMATCH")
         if str(user_row.get("active") or "") != "N":
             raise RuntimeError("USER_ACTIVE_STAGE_MISMATCH")
+        if str(user_row.get("phone_login") or "") != payload.extension:
+            raise RuntimeError("USER_PHONE_LOGIN_STAGE_MISMATCH")
+        if str(user_row.get("phone_pass") or "") != payload.extension:
+            raise RuntimeError("USER_PHONE_PASS_STAGE_MISMATCH")
 
         placeholders = ",".join(["%s"] * len(enabled_servers))
         activate_sql = (
@@ -2934,7 +2953,8 @@ def execute_provisioning(payload, expose_credentials=False):
         final_alias = validate_created_phone_alias(cursor, payload, identity)
         cursor.execute(
             """
-            SELECT user, full_name, user_level, user_group, active
+            SELECT user, full_name, user_level, user_group, active,
+                   phone_login, phone_pass
               FROM vicidial_users
              WHERE user=%s
              LIMIT 1
@@ -2944,6 +2964,10 @@ def execute_provisioning(payload, expose_credentials=False):
         final_user = cursor.fetchone()
         if not final_user or str(final_user.get("active") or "") != "Y":
             raise RuntimeError("USER_FINAL_VALIDATION_FAILED")
+        if str(final_user.get("phone_login") or "") != payload.extension:
+            raise RuntimeError("USER_PHONE_LOGIN_FINAL_MISMATCH")
+        if str(final_user.get("phone_pass") or "") != payload.extension:
+            raise RuntimeError("USER_PHONE_PASS_FINAL_MISMATCH")
 
         result = {
             "status": "SUCCESS",
@@ -2953,6 +2977,8 @@ def execute_provisioning(payload, expose_credentials=False):
             "username": payload.username.upper(),
             "full_name": payload.full_name,
             "extension": payload.extension,
+            "phone_login": payload.extension,
+            "phone_pass_policy": "MATCH_EXTENSION",
             "extension_source": reservation_source,
             "extension_action": (
                 "REUSE_EXISTING"
@@ -4722,7 +4748,8 @@ def compensate_group_change_mysql(
 
         if user_updated and user_snapshot:
             restore_fields = [
-                "pass", "full_name", "user_level", "user_group", "active"
+                "pass", "full_name", "user_level", "user_group", "active",
+                "phone_login", "phone_pass",
             ] + list(USER_CLONE_FIELDS)
             restore_sql = ", ".join(
                 "`%s`=%%s" % field for field in restore_fields
@@ -4894,7 +4921,8 @@ def execute_group_change(payload, preview):
         cursor = connection.cursor()
 
         user_snapshot_fields = [
-            "user", "pass", "full_name", "user_level", "user_group", "active"
+            "user", "pass", "full_name", "user_level", "user_group", "active",
+            "phone_login", "phone_pass",
         ] + list(USER_CLONE_FIELDS)
         user_snapshot_sql = ", ".join(
             "`%s`" % field for field in user_snapshot_fields
@@ -5014,9 +5042,17 @@ def execute_group_change(payload, preview):
         target_alias_logins = alias_plan["logins_list"]
         validate_created_phone_alias(cursor, target_payload, target_identity)
 
-        update_fields = ["pass", "user_level", "user_group"] + list(USER_CLONE_FIELDS)
+        update_fields = [
+            "pass", "user_level", "user_group", "phone_login", "phone_pass",
+        ] + list(USER_CLONE_FIELDS)
         update_sql = ", ".join("`%s`=%%s" % field for field in update_fields)
-        update_values = [target_password, 1, target_group] + [
+        update_values = [
+            target_password,
+            1,
+            target_group,
+            target_extension,
+            target_extension,
+        ] + [
             target_template.get(field) for field in USER_CLONE_FIELDS
         ]
         update_values.extend([username, source_group])
@@ -5097,7 +5133,8 @@ def execute_group_change(payload, preview):
         )
 
         final_user_fields = [
-            "user", "full_name", "user_level", "user_group", "active", "pass"
+            "user", "full_name", "user_level", "user_group", "active", "pass",
+            "phone_login", "phone_pass",
         ] + list(USER_CLONE_FIELDS)
         final_user_sql = ", ".join(
             "`%s`" % field for field in final_user_fields
@@ -5120,6 +5157,10 @@ def execute_group_change(payload, preview):
             raise RuntimeError("GROUP_CHANGE_FINAL_ACTIVE_MISMATCH")
         if final_user.get("pass") != target_password:
             raise RuntimeError("GROUP_CHANGE_FINAL_PASSWORD_MISMATCH")
+        if str(final_user.get("phone_login") or "") != target_extension:
+            raise RuntimeError("GROUP_CHANGE_FINAL_PHONE_LOGIN_MISMATCH")
+        if str(final_user.get("phone_pass") or "") != target_extension:
+            raise RuntimeError("GROUP_CHANGE_FINAL_PHONE_PASS_MISMATCH")
         for field in USER_CLONE_FIELDS:
             if final_user.get(field) != target_template.get(field):
                 raise RuntimeError(
@@ -5159,6 +5200,8 @@ def execute_group_change(payload, preview):
             "source_extension": source_extension,
             "target_extension": target_extension,
             "extension": target_extension,
+            "phone_login": target_extension,
+            "phone_pass_policy": "MATCH_EXTENSION",
             "required_nodes": len(final_phones),
             "phone_alias": {
                 "alias_id": str(final_alias.get("alias_id") or ""),
