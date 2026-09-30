@@ -124,5 +124,19 @@
     "allocation_start": 82737,
     "reuse_free": false,
     "allocation_policy": "SEQUENTIAL_NEW_ONLY"
+  },
+  "CC-CORTIZO-T-PERDIDA": {
+    "start": 82800,
+    "end": 82899,
+    "allocation_start": 82800,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
+  },
+  "CC-CORTIZO-T-RET": {
+    "start": 82900,
+    "end": 82999,
+    "allocation_start": 82900,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   }
 }
