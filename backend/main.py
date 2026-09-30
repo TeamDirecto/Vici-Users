@@ -723,9 +723,12 @@ def phone_provisioning_dry_run(user_group, extension):
                  WHERE user_group=%s
                    AND server_ip=%s
                    AND active='Y'
-                   AND extension >= %s
-                   AND extension <= %s
-                 ORDER BY extension
+                 ORDER BY
+                   CASE
+                     WHEN extension >= %s AND extension <= %s THEN 0
+                     ELSE 1
+                   END,
+                   extension
                  LIMIT 1
                 """,
                 (
@@ -1830,9 +1833,12 @@ def preview_extension_allocations(user_group, requested, allow_free=True):
                  WHERE user_group=%s
                    AND server_ip=%s
                    AND active='Y'
-                   AND extension >= %s
-                   AND extension <= %s
-                 ORDER BY extension
+                 ORDER BY
+                   CASE
+                     WHEN extension >= %s AND extension <= %s THEN 0
+                     ELSE 1
+                   END,
+                   extension
                  LIMIT 1
                 """,
                 (
