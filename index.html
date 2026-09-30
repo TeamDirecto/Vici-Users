@@ -857,7 +857,8 @@
       if(data.extension_range){
         const r=data.extension_range;
         const floor=r.allocation_start||r.start;
-        $('extensionRule').value=`${r.start} – ${r.end} (${r.capacity} posiciones) · altas nuevas desde ${floor}`;
+        const policy=r.allocation_policy==='SEQUENTIAL_NEW_ONLY'?' · secuencial':'';
+        $('extensionRule').value=`${r.start} – ${r.end} (${r.capacity} posiciones) · altas nuevas desde ${floor}${policy}`;
       }else{
         $('extensionRule').value='Sin bloque configurado';
       }
@@ -867,7 +868,7 @@
       const allocatableUncreated=(s.allocatable_uncreated!==undefined?s.allocatable_uncreated:s.uncreated);
       const reservedPlan=(s.homologation_reserved_positions||0);
       $('extensionPoolStatus').textContent=
-        'Inventario: '+s.free+' reciclable(s) · '+allocatableUncreated+' disponible(s) nueva(s) · '+s.legacy+' legacy'+
+        'Inventario: '+allocatableUncreated+' disponible(s) nueva(s) secuencial(es) · '+s.free+' FREE retenida(s) · '+s.legacy+' legacy'+
         (reservedPlan?' · '+reservedPlan+' posición(es) reservada(s) por homologación':'')+
         (floor?' · siguiente alta ≥ '+floor:'')+
         (s.group_mismatches?' · ⚠ '+s.group_mismatches+' desalineada(s)':'')+'.';
@@ -905,7 +906,7 @@
       loadSupervisorGroups();
     }else{
       $('pageTitle').textContent='Alta masiva de usuarios';
-      $('pageSub').textContent='Alta de usuario + extensión: bloques homologados de 100 posiciones; la siguiente alta respeta el piso definido por la homologación.';
+      $('pageSub').textContent='Alta de usuario + extensión: bloques homologados de 100 posiciones con asignación estrictamente secuencial.';
     }
   }
 
