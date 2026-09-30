@@ -2,91 +2,127 @@
   "CC-CORTIZO-BANCO-AZT": {
     "start": 81000,
     "end": 81099,
-    "allocation_start": 81038
+    "allocation_start": 81038,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-BANORTE": {
     "start": 81100,
     "end": 81199,
-    "allocation_start": 81129
+    "allocation_start": 81129,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-BBVA": {
     "start": 81200,
     "end": 81299,
-    "allocation_start": 81216
+    "allocation_start": 81216,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-GMF": {
     "start": 81300,
     "end": 81399,
-    "allocation_start": 81335
+    "allocation_start": 81335,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-LABORATOR": {
     "start": 81400,
     "end": 81499,
-    "allocation_start": 81406
+    "allocation_start": 81406,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-LIBERTAD": {
     "start": 81500,
     "end": 81599,
-    "allocation_start": 81524
+    "allocation_start": 81524,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-NISSAN": {
     "start": 81600,
     "end": 81699,
-    "allocation_start": 81628
+    "allocation_start": 81628,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-NISSAN-LA": {
     "start": 81700,
     "end": 81799,
-    "allocation_start": 81733
+    "allocation_start": 81733,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-RAPIDAUTO": {
     "start": 81800,
     "end": 81899,
-    "allocation_start": 81806
+    "allocation_start": 81806,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-SA": {
     "start": 81900,
     "end": 81999,
-    "allocation_start": 81918
+    "allocation_start": 81918,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-SCOTI": {
     "start": 82000,
     "end": 82099,
-    "allocation_start": 82008
+    "allocation_start": 82008,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-SCOTI-AUT": {
     "start": 82100,
     "end": 82199,
-    "allocation_start": 82111
+    "allocation_start": 82111,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-SCOTI-PR": {
     "start": 82200,
     "end": 82299,
-    "allocation_start": 82203
+    "allocation_start": 82203,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-SICREA": {
     "start": 82300,
     "end": 82399,
-    "allocation_start": 82311
+    "allocation_start": 82311,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-TOTALPLAY": {
     "start": 82400,
     "end": 82499,
-    "allocation_start": 82475
+    "allocation_start": 82475,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-TOYOTA": {
     "start": 82500,
     "end": 82599,
-    "allocation_start": 82513
+    "allocation_start": 82513,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-UNIFIN": {
     "start": 82600,
     "end": 82699,
-    "allocation_start": 82604
+    "allocation_start": 82604,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   },
   "CC-CORTIZO-VW": {
     "start": 82700,
     "end": 82799,
-    "allocation_start": 82737
+    "allocation_start": 82737,
+    "reuse_free": false,
+    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
   }
 }
