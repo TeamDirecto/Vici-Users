@@ -135,7 +135,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.22.0-homologation-ranges")
+app = FastAPI(title="Vici-Users API", version="0.22.1-sequential-allocation")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -540,11 +540,31 @@ def load_extension_ranges():
                     % (group, allocation_start)
                 ),
             )
+        reuse_free = bool(value.get("reuse_free", True))
+        allocation_policy = str(
+            value.get(
+                "allocation_policy",
+                "FREE_THEN_SEQUENTIAL" if reuse_free else "SEQUENTIAL_NEW_ONLY",
+            )
+        ).strip().upper()
+        if allocation_policy not in {
+            "FREE_THEN_SEQUENTIAL",
+            "SEQUENTIAL_NEW_ONLY",
+        }:
+            raise HTTPException(
+                status_code=503,
+                detail="allocation_policy inválida para %s" % group,
+            )
+        if allocation_policy == "SEQUENTIAL_NEW_ONLY":
+            reuse_free = False
+
         clean[group] = {
             "start": start,
             "end": end,
             "capacity": capacity,
             "allocation_start": allocation_start,
+            "reuse_free": reuse_free,
+            "allocation_policy": allocation_policy,
         }
     return clean
 
@@ -847,7 +867,7 @@ def phone_provisioning_dry_run(user_group, extension):
 
 def free_reuse_precheck(user_group, extension, expected_reserved_user=None):
     """Fail-closed validation for reusing an extension already managed as FREE."""
-    require_provisioning_group(user_group)
+    extension_range = require_provisioning_group(user_group)
     extension_text = str(extension or "").strip()
     identity = canonical_phone_plan(user_group, extension_text)
     enabled_nodes = [node for node in identity["nodes"] if node["enabled"]]
@@ -908,6 +928,9 @@ def free_reuse_precheck(user_group, extension, expected_reserved_user=None):
 
     blockers = []
     warnings = []
+
+    if not bool(extension_range.get("reuse_free", True)):
+        blockers.append("FREE_REUSE_DISABLED_BY_ALLOCATION_POLICY")
 
     if status == "FREE" and inventory.get("current_user"):
         blockers.append("FREE_INVENTORY_CURRENT_USER_PRESENT")
@@ -1684,6 +1707,7 @@ def extension_candidate_pool(user_group):
     allocation_start = int(
         extension_range.get("allocation_start", extension_range["start"])
     )
+    reuse_free = bool(extension_range.get("reuse_free", True))
     extensions = [
         str(value)
         for value in range(extension_range["start"], extension_range["end"] + 1)
@@ -1765,7 +1789,8 @@ def extension_candidate_pool(user_group):
                 cooldown_ok = False
 
             if (
-                len(rows) == len(enabled_servers)
+                reuse_free
+                and len(rows) == len(enabled_servers)
                 and servers == enabled_servers
                 and groups_aligned
                 and phones_inactive
@@ -3322,6 +3347,10 @@ def extension_inventory_snapshot(user_group):
     start = extension_range["start"]
     end = extension_range["end"]
     allocation_start = int(extension_range.get("allocation_start", start))
+    reuse_free = bool(extension_range.get("reuse_free", True))
+    allocation_policy = str(
+        extension_range.get("allocation_policy") or "FREE_THEN_SEQUENTIAL"
+    )
     extensions = [str(value) for value in range(start, end + 1)]
     placeholders = ",".join(["%s"] * len(extensions))
 
@@ -3432,7 +3461,8 @@ def extension_inventory_snapshot(user_group):
     free_candidates = [
         row["extension"] for row in positions
         if (
-            int(row["extension"]) >= allocation_start
+            reuse_free
+            and int(row["extension"]) >= allocation_start
             and row["status"] == "FREE"
             and row["topology_complete"]
             and row["server_count"] == row["expected_enabled_server_count"]
@@ -3464,6 +3494,8 @@ def extension_inventory_snapshot(user_group):
         "summary": {
             "capacity": len(extensions),
             "allocation_start": allocation_start,
+            "allocation_policy": allocation_policy,
+            "reuse_free": reuse_free,
             "homologation_reserved_positions": homologation_reserved_positions,
             "allocatable_window_capacity": allocatable_window_capacity,
             "allocatable_uncreated": len(uncreated_candidates),
@@ -6504,7 +6536,7 @@ def preview_users(payload: PreviewRequest, request: Request):
     extension_preview = preview_extension_allocations(
         payload.user_group,
         len(available_rows),
-        allow_free=True,
+        allow_free=bool(extension_range.get("reuse_free", True)),
     )
     allocations = list(extension_preview["allocations"])
 
