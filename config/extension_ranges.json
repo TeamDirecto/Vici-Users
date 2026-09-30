@@ -129,14 +129,14 @@
     "start": 82800,
     "end": 82899,
     "allocation_start": 82800,
-    "reuse_free": false,
-    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
+    "reuse_free": true,
+    "allocation_policy": "FREE_THEN_SEQUENTIAL"
   },
   "CC-CORTIZO-T-RET": {
     "start": 82900,
     "end": 82999,
     "allocation_start": 82900,
-    "reuse_free": false,
-    "allocation_policy": "SEQUENTIAL_NEW_ONLY"
+    "reuse_free": true,
+    "allocation_policy": "FREE_THEN_SEQUENTIAL"
   }
 }
