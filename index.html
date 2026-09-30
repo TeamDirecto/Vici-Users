@@ -19,7 +19,7 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand"><div class="mark">VU</div><div><strong>Vici-Users</strong><small>Provisioning Console</small></div></div>
-    <div><div class="nav-title">EHECTO</div><button class="nav active" id="navProvision" type="button">＋ Alta de usuarios</button><button class="nav" id="navSupervisors" type="button">★ Alta de supervisores</button><button class="nav" id="navGroupChange" type="button">⇄ Cambio de User Group</button><button class="nav" id="navAudit" type="button">♻ Auditoría de extensiones</button></div>
+    <div><div class="nav-title">EHECTO</div><button class="nav active" id="navProvision" type="button">＋ Alta de usuarios</button><button class="nav" id="navSupervisors" type="button">★ Alta de supervisores</button><button class="nav" id="navGroupAdmin" type="button">⚙ Alta de User Group</button><button class="nav" id="navGroupChange" type="button">⇄ Cambio de User Group</button><button class="nav" id="navAudit" type="button">♻ Auditoría de extensiones</button></div>
     <div class="server"><div><span id="serverDot" class="dot"></span><strong>vici97</strong></div><p id="serverText">Comprobando API en vici97 y base vici222…</p></div>
   </aside>
 
@@ -148,6 +148,69 @@
               <button class="btn success" id="supervisorCreateBtn" disabled>Crear supervisor</button>
             </div>
             <div class="hint" id="supervisorCreateHint">La contraseña se genera únicamente al ejecutar y se muestra una sola vez.</div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div id="groupAdminView" class="hidden">
+      <section class="layout">
+        <div class="card">
+          <div class="head"><div><h2>Alta de User Group</h2><p>Integra un User Group existente de VICIdial al flujo administrado.</p></div><span class="step">Automático</span></div>
+          <div class="body">
+            <div id="groupAdminError" class="conn-error hidden"></div>
+            <div class="field">
+              <label>User Group nuevo</label>
+              <select id="groupAdminTarget" disabled><option>Cargando…</option></select>
+              <div class="hint">Sólo aparecen User Groups de VICIdial que todavía no están administrados por Vici-Users.</div>
+            </div>
+            <div class="field">
+              <label>Clonar configuración desde</label>
+              <select id="groupAdminSource" disabled><option>Cargando…</option></select>
+              <div class="hint">Se heredan permisos del BASE_* y la plantilla de phones del grupo seleccionado.</div>
+            </div>
+            <div class="field">
+              <label>Usuario BASE <span style="font-weight:500;color:#64748b">(opcional)</span></label>
+              <input id="groupAdminBase" type="text" maxlength="20" placeholder="Automático, ej. BASE_NUEVO" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label>Password default</label>
+              <input id="groupAdminPassword" type="password" maxlength="100" autocomplete="new-password" placeholder="Password de agentes de este grupo" />
+              <div class="hint">Se guarda únicamente en vici97; no se almacena en GitHub ni se devuelve después de crear.</div>
+            </div>
+            <div class="field">
+              <label>Bloque de extensiones</label>
+              <input id="groupAdminRange" type="text" value="Asignar siguiente bloque automáticamente" disabled />
+              <div class="hint">Bloques de 100, inicio XX00 y política SEQUENTIAL_NEW_ONLY. Los phones se crean sólo al dar de alta agentes.</div>
+            </div>
+            <div class="btns">
+              <button class="btn primary" id="groupAdminPreviewBtn" disabled>Previsualizar configuración</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="head"><div><h2>Previsualización</h2><p>Valida BASE, plantilla de phones y siguiente bloque libre antes de guardar.</p></div><span class="step">Admin</span></div>
+          <div id="groupAdminEmpty" class="empty"><strong>Aún no hay configuración para revisar</strong><p>Selecciona el grupo nuevo y el grupo que servirá como plantilla.</p></div>
+          <div id="groupAdminResult" class="body hidden">
+            <div id="groupAdminBlocker" class="conn-error hidden"></div>
+            <div class="template">
+              <div><span>User Group</span><strong id="gaGroup">—</strong></div>
+              <div><span>Nombre VICIdial</span><strong id="gaGroupName">—</strong></div>
+              <div><span>BASE nuevo</span><strong id="gaBase">—</strong></div>
+              <div><span>BASE origen</span><strong id="gaSourceBase">—</strong></div>
+              <div><span>Plantilla de phones</span><strong id="gaPhoneTemplate">—</strong></div>
+              <div><span>Bloque automático</span><strong id="gaRange">—</strong></div>
+              <div><span>Política</span><strong>SEQUENTIAL_NEW_ONLY</strong></div>
+              <div><span>Phones iniciales</span><strong>0 · bajo demanda</strong></div>
+            </div>
+            <div class="rule">
+              <strong>Al crear:</strong> se genera el BASE_* inactivo, se guarda el password default, se registra el rango y se configura la herencia de phones. No se crean extensiones en este paso.
+            </div>
+            <div class="btns">
+              <button class="btn success" id="groupAdminCreateBtn" disabled>Crear configuración del User Group</button>
+            </div>
+            <div class="hint" id="groupAdminCreateHint">Disponible sólo para administradores con escritura del portal habilitada.</div>
           </div>
         </div>
       </section>
@@ -345,6 +408,8 @@
   let authUser = null;
   let pendingOperationKey = null;
   let pendingProvisioning = null;
+  let groupAdminOptionsLoaded = false;
+  let groupAdminPreviewPayload = null;
   let groupChangeGroupsLoaded = false;
   let groupChangePreviewPayload = null;
   let groupChangeOperationKey = null;
@@ -452,6 +517,8 @@
     previewPayload=null;
     pendingOperationKey=null;
     pendingProvisioning=null;
+    groupAdminOptionsLoaded=false;
+    groupAdminPreviewPayload=null;
     groupChangeGroupsLoaded=false;
     groupChangePreviewPayload=null;
     groupChangeOperationKey=null;
@@ -879,16 +946,19 @@
   function showView(view){
     const audit=view==='audit';
     const groupChange=view==='group-change';
+    const groupAdmin=view==='group-admin';
     const supervisors=view==='supervisors';
-    const provision=!audit&&!groupChange&&!supervisors;
+    const provision=!audit&&!groupChange&&!groupAdmin&&!supervisors;
 
     $('provisionView').classList.toggle('hidden',!provision);
     $('supervisorView').classList.toggle('hidden',!supervisors);
+    $('groupAdminView').classList.toggle('hidden',!groupAdmin);
     $('groupChangeView').classList.toggle('hidden',!groupChange);
     $('auditView').classList.toggle('hidden',!audit);
 
     $('navProvision').classList.toggle('active',provision);
     $('navSupervisors').classList.toggle('active',supervisors);
+    $('navGroupAdmin').classList.toggle('active',groupAdmin);
     $('navGroupChange').classList.toggle('active',groupChange);
     $('navAudit').classList.toggle('active',audit);
 
@@ -896,6 +966,10 @@
       $('pageTitle').textContent='Auditoría de extensiones';
       $('pageSub').textContent='Estado de los bloques, extensiones legacy, reciclables y desalineaciones.';
       loadAudit();
+    }else if(groupAdmin){
+      $('pageTitle').textContent='Alta de User Group';
+      $('pageSub').textContent='Integra un User Group existente, crea su BASE_* y asigna automáticamente el siguiente bloque de 100 extensiones.';
+      loadGroupAdminOptions();
     }else if(groupChange){
       $('pageTitle').textContent='Cambio de User Group';
       $('pageSub').textContent='Migra permisos, contraseña y extensión al User Group destino con liberación controlada de la extensión anterior.';
@@ -907,6 +981,137 @@
     }else{
       $('pageTitle').textContent='Alta masiva de usuarios';
       $('pageSub').textContent='Alta de usuario + extensión: bloques homologados de 100 posiciones con asignación estrictamente secuencial.';
+    }
+  }
+
+  async function loadGroupAdminOptions(force=false){
+    if(groupAdminOptionsLoaded&&!force)return;
+    const target=$('groupAdminTarget');
+    const source=$('groupAdminSource');
+    target.disabled=true;source.disabled=true;
+    try{
+      const data=await api('/group-admin/options');
+      target.innerHTML='<option value="">Selecciona User Group nuevo</option>'+
+        (data.unmanaged_groups||[]).map(g=>'<option value="'+escapeHtml(g.user_group)+'">'+escapeHtml(g.user_group)+(g.group_name?' · '+escapeHtml(g.group_name):'')+'</option>').join('');
+      source.innerHTML='<option value="">Selecciona plantilla origen</option>'+
+        (data.source_groups||[]).map(g=>'<option value="'+escapeHtml(g.user_group)+'">'+escapeHtml(g.user_group)+(g.group_name?' · '+escapeHtml(g.group_name):'')+'</option>').join('');
+      const r=data.next_extension_range||{};
+      $('groupAdminRange').value=(r.start&&r.end)?r.start+' – '+r.end+' · automático':'Sin bloque disponible';
+      target.disabled=false;source.disabled=false;
+      groupAdminOptionsLoaded=true;
+      updateGroupAdminPreviewButton();
+    }catch(error){
+      $('groupAdminError').textContent=error.message;
+      $('groupAdminError').classList.remove('hidden');
+      toast(error.message);
+    }
+  }
+
+  function updateGroupAdminPreviewButton(){
+    $('groupAdminPreviewBtn').disabled=!Boolean(
+      $('groupAdminTarget').value&&$('groupAdminSource').value
+    );
+    $('groupAdminCreateBtn').disabled=true;
+    groupAdminPreviewPayload=null;
+  }
+
+  async function previewGroupAdmin(){
+    const user_group=$('groupAdminTarget').value;
+    const source_group=$('groupAdminSource').value;
+    const base_user=$('groupAdminBase').value.trim();
+    if(!user_group||!source_group)return;
+    $('groupAdminPreviewBtn').disabled=true;
+    $('groupAdminPreviewBtn').textContent='Validando…';
+    try{
+      const payload={user_group,source_group};
+      if(base_user)payload.base_user=base_user;
+      const data=await api('/group-admin/preview',{method:'POST',body:JSON.stringify(payload)});
+      groupAdminPreviewPayload=data;
+      const r=data.extension_range||{};
+      $('gaGroup').textContent=data.user_group||'—';
+      $('gaGroupName').textContent=data.group_name||'—';
+      $('gaBase').textContent=data.base_user||'—';
+      $('gaSourceBase').textContent=data.source_template_user||'—';
+      $('gaPhoneTemplate').textContent=data.phone_template_group||'—';
+      $('gaRange').textContent=(r.start&&r.end)?r.start+' – '+r.end:'—';
+      $('groupAdminBase').value=data.base_user||base_user;
+      const blockers=data.blockers||[];
+      $('groupAdminBlocker').textContent=blockers.length?'Bloqueado: '+blockers.join(' · '):'';
+      $('groupAdminBlocker').classList.toggle('hidden',!blockers.length);
+      $('groupAdminEmpty').classList.add('hidden');
+      $('groupAdminResult').classList.remove('hidden');
+      const canCreate=Boolean(
+        data.status==='READY'&&
+        authUser&&authUser.role==='admin'&&authUser.portal_write_enabled&&
+        $('groupAdminPassword').value
+      );
+      $('groupAdminCreateBtn').disabled=!canCreate;
+      $('groupAdminCreateHint').textContent=canCreate
+        ? 'Listo. No se crearán phones hasta dar de alta el primer agente.'
+        : (blockers.length?'Corrige los bloqueos antes de crear.':'Captura el password default para habilitar la creación.');
+    }catch(error){
+      groupAdminPreviewPayload=null;
+      $('groupAdminBlocker').textContent=error.message;
+      $('groupAdminBlocker').classList.remove('hidden');
+      $('groupAdminEmpty').classList.add('hidden');
+      $('groupAdminResult').classList.remove('hidden');
+      toast(error.message);
+    }finally{
+      $('groupAdminPreviewBtn').textContent='Previsualizar configuración';
+      updateGroupAdminPreviewButtonAfterPreview();
+    }
+  }
+
+  function updateGroupAdminPreviewButtonAfterPreview(){
+    $('groupAdminPreviewBtn').disabled=!Boolean($('groupAdminTarget').value&&$('groupAdminSource').value);
+    const data=groupAdminPreviewPayload;
+    $('groupAdminCreateBtn').disabled=!Boolean(
+      data&&data.status==='READY'&&authUser&&authUser.role==='admin'&&
+      authUser.portal_write_enabled&&$('groupAdminPassword').value
+    );
+  }
+
+  async function createGroupAdmin(){
+    const data=groupAdminPreviewPayload;
+    if(!data||data.status!=='READY')return;
+    const password=$('groupAdminPassword').value;
+    if(!password){toast('Captura el password default.');return}
+    if(!window.confirm(
+      'Crear configuración para '+data.user_group+'\n\n'+
+      'BASE: '+data.base_user+'\n'+
+      'Rango: '+data.extension_range.start+'-'+data.extension_range.end+'\n\n'+
+      'No se crearán phones en este paso.'
+    ))return;
+
+    $('groupAdminCreateBtn').disabled=true;
+    $('groupAdminCreateBtn').textContent='Creando…';
+    try{
+      const result=await api('/group-admin/execute',{
+        method:'POST',
+        body:JSON.stringify({
+          user_group:data.user_group,
+          source_group:data.source_group,
+          base_user:data.base_user,
+          default_password:password
+        })
+      });
+      $('groupAdminPassword').value='';
+      toast('User Group '+result.user_group+' configurado correctamente.');
+      groupAdminOptionsLoaded=false;
+      groupAdminPreviewPayload=null;
+      await loadGroups();
+      await loadGroupAdminOptions(true);
+      $('groupAdminEmpty').classList.remove('hidden');
+      $('groupAdminResult').classList.add('hidden');
+      $('groupAdminTarget').value='';
+      $('groupAdminSource').value='';
+      $('groupAdminBase').value='';
+      updateGroupAdminPreviewButton();
+    }catch(error){
+      toast(error.message);
+    }finally{
+      $('groupAdminCreateBtn').textContent='Crear configuración del User Group';
+      updateGroupAdminPreviewButtonAfterPreview();
     }
   }
 
@@ -1349,7 +1554,13 @@
   $('confirmPhrase').addEventListener('input',()=>{$('confirmCreateBtn').disabled=$('confirmPhrase').value.trim()!=='CREAR'});
   $('cancelCreateBtn').addEventListener('click',closeCreateConfirmation);
   $('confirmCreateBtn').addEventListener('click',executePortalProvisioning);
-  $('navProvision').addEventListener('click',()=>showView('provision'));$('navSupervisors').addEventListener('click',()=>showView('supervisors'));$('navGroupChange').addEventListener('click',()=>showView('group-change'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
+  $('navProvision').addEventListener('click',()=>showView('provision'));$('navSupervisors').addEventListener('click',()=>showView('supervisors'));$('navGroupAdmin').addEventListener('click',()=>showView('group-admin'));$('navGroupChange').addEventListener('click',()=>showView('group-change'));$('navAudit').addEventListener('click',()=>showView('audit'));$('refreshAudit').addEventListener('click',loadAudit);
+  $('groupAdminTarget').addEventListener('change',updateGroupAdminPreviewButton);
+  $('groupAdminSource').addEventListener('change',updateGroupAdminPreviewButton);
+  $('groupAdminBase').addEventListener('input',updateGroupAdminPreviewButton);
+  $('groupAdminPassword').addEventListener('input',updateGroupAdminPreviewButtonAfterPreview);
+  $('groupAdminPreviewBtn').addEventListener('click',previewGroupAdmin);
+  $('groupAdminCreateBtn').addEventListener('click',createGroupAdmin);
   $('supervisorFirstNames').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorPaternal').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorMaternal').addEventListener('input',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorGroup').addEventListener('change',()=>{supervisorPreviewPayload=null;$('supervisorCreateBtn').disabled=true;updateSupervisorPreviewButton()});$('supervisorPreviewBtn').addEventListener('click',previewSupervisor);$('supervisorCreateBtn').addEventListener('click',createSupervisor);
   $('groupChangeUser').addEventListener('input',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true;updateGroupChangePreviewButton()});$('groupChangeSourceExtension').addEventListener('input',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true});$('groupChangeTarget').addEventListener('change',()=>{groupChangePreviewPayload=null;$('groupChangeApplyBtn').disabled=true;updateGroupChangePreviewButton()});$('groupChangePreviewBtn').addEventListener('click',previewGroupChange);$('groupChangeApplyBtn').addEventListener('click',applyGroupChange);
   $('userGroup').addEventListener('change',loadTemplate);$('previewBtn').addEventListener('click',validateBatch);$('revalidateBtn').addEventListener('click',validateBatch);
