@@ -854,10 +854,20 @@
     const group=$('userGroup').value;resetTemplate(group);$('templateWarning').classList.add('hidden');if(!group)return;
     try{
       const data=await api(`/groups/${encodeURIComponent(group)}/template`);$('passDefaultStatus').textContent=data.default_password_configured?'Configurado':'No configurado';
-      if(data.extension_range){$('extensionRule').value=`${data.extension_range.start} – ${data.extension_range.end} (${data.extension_range.capacity} posiciones)`}else{$('extensionRule').value='Sin bloque configurado'}
+      if(data.extension_range){
+        const r=data.extension_range;
+        const floor=r.allocation_start||r.start;
+        $('extensionRule').value=`${r.start} – ${r.end} (${r.capacity} posiciones) · altas nuevas desde ${floor}`;
+      }else{
+        $('extensionRule').value='Sin bloque configurado';
+      }
       if(!data.configured){$('templateWarning').textContent=`El grupo ${group} todavía no tiene usuario base configurado en vici97.`;$('templateWarning').classList.remove('hidden');return}
       const inventory=await api(`/groups/${encodeURIComponent(group)}/extensions/inventory`);const s=inventory.summary;
-      $('extensionPoolStatus').textContent='Inventario: '+s.free+' reciclable(s) · '+s.uncreated+' sin crear · '+s.legacy+' legacy'+(s.group_mismatches?' · ⚠ '+s.group_mismatches+' desalineada(s)':'')+'.';
+      const floor=(data.extension_range&&data.extension_range.allocation_start)||null;
+      $('extensionPoolStatus').textContent=
+        'Inventario: '+s.free+' reciclable(s) · '+s.uncreated+' sin crear · '+s.legacy+' legacy'+
+        (floor?' · siguiente alta nueva ≥ '+floor:'')+
+        (s.group_mismatches?' · ⚠ '+s.group_mismatches+' desalineada(s)':'')+'.';
       selectedTemplate=data.template;$('tplUser').textContent=selectedTemplate.user;$('tplLevel').textContent=selectedTemplate.user_level;$('tplGroup').textContent=selectedTemplate.user_group;$('tplName').textContent=selectedTemplate.full_name||'—';$('previewBtn').disabled=false;
     }catch(error){$('templateWarning').textContent=error.message;$('templateWarning').classList.remove('hidden');toast(error.message)}
   }
@@ -892,7 +902,7 @@
       loadSupervisorGroups();
     }else{
       $('pageTitle').textContent='Alta masiva de usuarios';
-      $('pageSub').textContent='Alta de usuario + extensión: cada User Group utiliza un BASE_* y una contraseña default protegidos en vici97.';
+      $('pageSub').textContent='Alta de usuario + extensión: bloques homologados de 100 posiciones; la siguiente alta respeta el piso definido por la homologación.';
     }
   }
 
@@ -1274,7 +1284,8 @@
         const mismatch=s.group_mismatches?'<span class="badge red">'+s.group_mismatches+'</span>':'<span class="badge green">0</span>';
         const next=s.next_candidate?'<code>'+escapeHtml(s.next_candidate)+'</code> <span class="badge gray">'+escapeHtml(s.next_candidate_source||'')+'</span>':'—';
         const incomplete=s.topology_incomplete?'<span class="badge amber">'+s.topology_incomplete+'</span>':'<span class="badge green">0</span>';
-        return '<tr><td><strong>'+escapeHtml(row.user_group)+'</strong></td><td><code>'+escapeHtml(r.start)+'–'+escapeHtml(r.end)+'</code></td><td>'+escapeHtml(s.legacy||0)+'</td><td>'+escapeHtml(s.free||0)+'</td><td>'+escapeHtml(s.uncreated||0)+'</td><td>'+incomplete+'</td><td>'+mismatch+'</td><td>'+next+'</td></tr>';
+        const rangeText=escapeHtml(r.start)+'–'+escapeHtml(r.end)+(r.allocation_start?' · altas ≥ '+escapeHtml(r.allocation_start):'');
+        return '<tr><td><strong>'+escapeHtml(row.user_group)+'</strong></td><td><code>'+rangeText+'</code></td><td>'+escapeHtml(s.legacy||0)+'</td><td>'+escapeHtml(s.free||0)+'</td><td>'+escapeHtml(s.uncreated||0)+'</td><td>'+incomplete+'</td><td>'+mismatch+'</td><td>'+next+'</td></tr>';
       }).join('');
     }catch(error){$('auditRows').innerHTML='<tr><td colspan="8"><span class="badge red">Error</span> '+escapeHtml(error.message)+'</td></tr>';toast(error.message)}
   }
