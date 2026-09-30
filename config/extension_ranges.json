@@ -1,74 +1,92 @@
 {
   "CC-CORTIZO-BANCO-AZT": {
-    "start": 81001,
-    "end": 81050
+    "start": 81000,
+    "end": 81099,
+    "allocation_start": 81038
   },
   "CC-CORTIZO-BANORTE": {
-    "start": 90101,
-    "end": 90150
+    "start": 81100,
+    "end": 81199,
+    "allocation_start": 81129
   },
   "CC-CORTIZO-BBVA": {
-    "start": 90200,
-    "end": 90249
+    "start": 81200,
+    "end": 81299,
+    "allocation_start": 81216
   },
   "CC-CORTIZO-GMF": {
-    "start": 97101,
-    "end": 97150
+    "start": 81300,
+    "end": 81399,
+    "allocation_start": 81335
   },
   "CC-CORTIZO-LABORATOR": {
-    "start": 84200,
-    "end": 84249
+    "start": 81400,
+    "end": 81499,
+    "allocation_start": 81406
   },
   "CC-CORTIZO-LIBERTAD": {
-    "start": 86001,
-    "end": 86050
+    "start": 81500,
+    "end": 81599,
+    "allocation_start": 81524
   },
   "CC-CORTIZO-NISSAN": {
-    "start": 85001,
-    "end": 85050
+    "start": 81600,
+    "end": 81699,
+    "allocation_start": 81628
   },
   "CC-CORTIZO-NISSAN-LA": {
-    "start": 84001,
-    "end": 84050
+    "start": 81700,
+    "end": 81799,
+    "allocation_start": 81733
   },
   "CC-CORTIZO-RAPIDAUTO": {
-    "start": 80101,
-    "end": 80150
+    "start": 81800,
+    "end": 81899,
+    "allocation_start": 81806
   },
   "CC-CORTIZO-SA": {
-    "start": 95301,
-    "end": 95350
+    "start": 81900,
+    "end": 81999,
+    "allocation_start": 81918
   },
   "CC-CORTIZO-SCOTI": {
-    "start": 98300,
-    "end": 98349
+    "start": 82000,
+    "end": 82099,
+    "allocation_start": 82008
   },
   "CC-CORTIZO-SCOTI-AUT": {
-    "start": 98101,
-    "end": 98150
+    "start": 82100,
+    "end": 82199,
+    "allocation_start": 82111
   },
   "CC-CORTIZO-SCOTI-PR": {
-    "start": 98200,
-    "end": 98249
+    "start": 82200,
+    "end": 82299,
+    "allocation_start": 82203
   },
   "CC-CORTIZO-SICREA": {
-    "start": 83001,
-    "end": 83050
+    "start": 82300,
+    "end": 82399,
+    "allocation_start": 82311
   },
   "CC-CORTIZO-TOTALPLAY": {
-    "start": 96101,
-    "end": 96150
+    "start": 82400,
+    "end": 82499,
+    "allocation_start": 82475
   },
   "CC-CORTIZO-TOYOTA": {
-    "start": 82001,
-    "end": 82050
+    "start": 82500,
+    "end": 82599,
+    "allocation_start": 82513
   },
   "CC-CORTIZO-UNIFIN": {
-    "start": 91001,
-    "end": 91050
+    "start": 82600,
+    "end": 82699,
+    "allocation_start": 82604
   },
   "CC-CORTIZO-VW": {
-    "start": 95201,
-    "end": 95250
+    "start": 82700,
+    "end": 82799,
+    "allocation_start": 82737
   }
 }
