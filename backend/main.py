@@ -1716,6 +1716,12 @@ def extension_candidate_pool(user_group):
     uncreated_candidates = []
 
     for extension in extensions:
+        # Durante la transición de homologación, las posiciones inferiores
+        # a allocation_start quedan reservadas para el mapeo aprobado.
+        # No se reciclan ni se crean automáticamente desde el portal.
+        if int(extension) < allocation_start:
+            continue
+
         rows = phones_by_extension.get(extension, [])
         tracked = local_inventory.get(extension)
 
@@ -3309,6 +3315,7 @@ def extension_inventory_snapshot(user_group):
     known_servers = set(node["server_ip"] for node in topology["nodes"])
     start = extension_range["start"]
     end = extension_range["end"]
+    allocation_start = int(extension_range.get("allocation_start", start))
     extensions = [str(value) for value in range(start, end + 1)]
     placeholders = ",".join(["%s"] * len(extensions))
 
@@ -3419,7 +3426,8 @@ def extension_inventory_snapshot(user_group):
     free_candidates = [
         row["extension"] for row in positions
         if (
-            row["status"] == "FREE"
+            int(row["extension"]) >= allocation_start
+            and row["status"] == "FREE"
             and row["topology_complete"]
             and row["server_count"] == row["expected_enabled_server_count"]
             and row["active_rows"] == 0
@@ -3427,8 +3435,14 @@ def extension_inventory_snapshot(user_group):
         )
     ]
     uncreated_candidates = [
-        row["extension"] for row in positions if row["status"] == "UNCREATED"
+        row["extension"] for row in positions
+        if (
+            int(row["extension"]) >= allocation_start
+            and row["status"] == "UNCREATED"
+        )
     ]
+    homologation_reserved_positions = max(0, allocation_start - start)
+    allocatable_window_capacity = max(0, end - allocation_start + 1)
     next_candidate = None
     next_candidate_source = None
     if free_candidates:
@@ -3443,6 +3457,10 @@ def extension_inventory_snapshot(user_group):
         "extension_range": extension_range,
         "summary": {
             "capacity": len(extensions),
+            "allocation_start": allocation_start,
+            "homologation_reserved_positions": homologation_reserved_positions,
+            "allocatable_window_capacity": allocatable_window_capacity,
+            "allocatable_uncreated": len(uncreated_candidates),
             "uncreated": counts["UNCREATED"],
             "legacy": counts["LEGACY"],
             "free": counts["FREE"],
