@@ -3753,6 +3753,16 @@ def resolve_agent_password(user_group, override_password=None):
     return password
 
 
+class GroupAdminPreviewRequest(BaseModel):
+    user_group: str = Field(..., min_length=1, max_length=20)
+    source_group: str = Field(..., min_length=1, max_length=20)
+    base_user: Optional[str] = Field(None, max_length=20)
+
+
+class GroupAdminExecuteRequest(GroupAdminPreviewRequest):
+    default_password: str = Field(..., min_length=1, max_length=100)
+
+
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
     password: str = Field(..., min_length=1, max_length=256)
@@ -3994,6 +4004,284 @@ def health():
         "disabled_nodes_count": disabled_nodes_count,
     }
 
+
+def _suggest_base_user(user_group):
+    prefix = "CC-CORTIZO-"
+    suffix = user_group[len(prefix):] if user_group.startswith(prefix) else user_group
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", suffix).strip("_").upper()
+    return ("BASE_" + suffix)[:20]
+
+
+def _next_automatic_extension_block():
+    ranges = load_extension_ranges()
+    max_end = max([int(item["end"]) for item in ranges.values()] or [80999])
+    candidate = ((max_end // 100) + 1) * 100
+
+    with db_cursor() as cursor:
+        for _ in range(100):
+            start = candidate
+            end = candidate + 99
+            overlaps = any(
+                not (end < int(item["start"]) or start > int(item["end"]))
+                for item in ranges.values()
+            )
+            if overlaps:
+                candidate += 100
+                continue
+
+            cursor.execute(
+                """
+                SELECT extension FROM phones
+                 WHERE extension REGEXP '^[0-9]+$'
+                   AND CAST(extension AS UNSIGNED) BETWEEN %s AND %s
+                 LIMIT 1
+                """,
+                (start, end),
+            )
+            phone_collision = cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT alias_id FROM phones_alias
+                 WHERE alias_id REGEXP '^[0-9]+$'
+                   AND CAST(alias_id AS UNSIGNED) BETWEEN %s AND %s
+                 LIMIT 1
+                """,
+                (start, end),
+            )
+            alias_collision = cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT user FROM vicidial_users
+                 WHERE phone_login REGEXP '^[0-9]+$'
+                   AND CAST(phone_login AS UNSIGNED) BETWEEN %s AND %s
+                 LIMIT 1
+                """,
+                (start, end),
+            )
+            user_collision = cursor.fetchone()
+            if not phone_collision and not alias_collision and not user_collision:
+                return {
+                    "start": start,
+                    "end": end,
+                    "allocation_start": start,
+                    "reuse_free": False,
+                    "allocation_policy": "SEQUENTIAL_NEW_ONLY",
+                    "capacity": 100,
+                }
+            candidate += 100
+    raise HTTPException(status_code=409, detail="NO_AUTOMATIC_EXTENSION_BLOCK_AVAILABLE")
+
+
+def _group_admin_plan(user_group, source_group, base_user=None):
+    user_group = str(user_group or "").strip()
+    source_group = str(source_group or "").strip()
+    base_user = str(base_user or "").strip().upper() or _suggest_base_user(user_group)
+    blockers = []
+    if not re.match(r"^[A-Za-z0-9_-]+$", user_group):
+        blockers.append("INVALID_USER_GROUP")
+    if not re.match(r"^[A-Za-z0-9_]+$", base_user):
+        blockers.append("INVALID_BASE_USER")
+    if len(base_user) > 20:
+        blockers.append("BASE_USER_TOO_LONG")
+
+    managed = set(load_managed_groups())
+    if user_group in managed:
+        blockers.append("USER_GROUP_ALREADY_MANAGED")
+    if source_group not in managed:
+        blockers.append("SOURCE_GROUP_NOT_MANAGED")
+
+    templates = load_group_templates()
+    source_template_user = templates.get(source_group)
+    if not source_template_user:
+        blockers.append("SOURCE_GROUP_TEMPLATE_NOT_CONFIGURED")
+
+    phone_template_group = load_phone_template_groups().get(source_group, source_group)
+    required_servers = [node["server_ip"] for node in load_cluster_nodes()["nodes"] if node["enabled"]]
+    target_group_row = None
+    source_user_row = None
+    phone_servers = set()
+
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT user_group, group_name FROM vicidial_user_groups WHERE user_group=%s LIMIT 1",
+            (user_group,),
+        )
+        target_group_row = cursor.fetchone()
+        if not target_group_row:
+            blockers.append("TARGET_USER_GROUP_NOT_FOUND_IN_VICIDIAL")
+
+        cursor.execute("SELECT user FROM vicidial_users WHERE user=%s LIMIT 1", (base_user,))
+        if cursor.fetchone():
+            blockers.append("BASE_USER_ALREADY_EXISTS")
+
+        if source_template_user:
+            cursor.execute(
+                "SELECT user, user_group FROM vicidial_users WHERE user=%s AND user_group=%s LIMIT 1",
+                (source_template_user, source_group),
+            )
+            source_user_row = cursor.fetchone()
+            if not source_user_row:
+                blockers.append("SOURCE_TEMPLATE_USER_NOT_FOUND")
+
+        if required_servers:
+            placeholders = ",".join(["%s"] * len(required_servers))
+            cursor.execute(
+                """
+                SELECT DISTINCT server_ip FROM phones
+                 WHERE user_group=%s
+                   AND active='Y'
+                   AND status='ACTIVE'
+                   AND template_id IS NOT NULL
+                   AND template_id <> ''
+                   AND conf_secret IS NOT NULL
+                   AND LENGTH(conf_secret) > 0
+                   AND server_ip IN (%s)
+                """ % placeholders,
+                tuple([phone_template_group] + required_servers),
+            )
+            phone_servers = set(str(row["server_ip"]) for row in cursor.fetchall())
+
+    missing = sorted(set(required_servers).difference(phone_servers))
+    if missing:
+        blockers.append("PHONE_TEMPLATE_INCOMPLETE:%s" % ",".join(missing))
+
+    extension_range = _next_automatic_extension_block()
+    return {
+        "status": "READY" if not blockers else "BLOCKED",
+        "blockers": blockers,
+        "user_group": user_group,
+        "group_name": target_group_row.get("group_name") if target_group_row else None,
+        "base_user": base_user,
+        "source_group": source_group,
+        "source_template_user": source_template_user,
+        "phone_template_group": phone_template_group,
+        "extension_range": extension_range,
+        "default_password_required": True,
+    }
+
+
+@app.get("/api/group-admin/options")
+def group_admin_options(request: Request):
+    require_operator_session(request, allowed_roles={"admin"})
+    managed = set(load_managed_groups())
+    templates = load_group_templates()
+    ranges = load_extension_ranges()
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user_group, group_name
+              FROM vicidial_user_groups
+             WHERE user_group IS NOT NULL AND user_group <> ''
+             ORDER BY user_group
+            """
+        )
+        rows = cursor.fetchall()
+    unmanaged = [row for row in rows if row["user_group"] not in managed]
+    source_groups = [
+        row for row in rows
+        if row["user_group"] in managed
+        and row["user_group"] in templates
+        and row["user_group"] in ranges
+    ]
+    return {
+        "unmanaged_groups": unmanaged,
+        "source_groups": source_groups,
+        "next_extension_range": _next_automatic_extension_block(),
+    }
+
+
+@app.post("/api/group-admin/preview")
+def group_admin_preview(payload: GroupAdminPreviewRequest, request: Request):
+    require_operator_session(request, allowed_roles={"admin"})
+    return _group_admin_plan(payload.user_group, payload.source_group, payload.base_user)
+
+
+@app.post("/api/group-admin/execute")
+def group_admin_execute(payload: GroupAdminExecuteRequest, request: Request):
+    session = require_portal_write_gate(request)
+    plan = _group_admin_plan(payload.user_group, payload.source_group, payload.base_user)
+    if plan["status"] != "READY":
+        raise HTTPException(status_code=409, detail={"code": "GROUP_ADMIN_BLOCKED", "blockers": plan["blockers"]})
+
+    user_group = plan["user_group"]
+    base_user = plan["base_user"]
+    source_group = plan["source_group"]
+    source_template_user = plan["source_template_user"]
+    phone_template_group = plan["phone_template_group"]
+    extension_range = plan["extension_range"]
+
+    select_fields = ", ".join("`%s`" % field for field in USER_CLONE_FIELDS)
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT %s FROM vicidial_users WHERE user=%%s AND user_group=%%s LIMIT 1" % select_fields,
+            (source_template_user, source_group),
+        )
+        source = cursor.fetchone()
+        if not source:
+            raise HTTPException(status_code=409, detail="SOURCE_TEMPLATE_USER_NOT_FOUND")
+        insert_columns = ["user", "pass", "full_name", "user_level", "user_group", "active", "phone_login", "phone_pass"] + list(USER_CLONE_FIELDS)
+        values = [
+            base_user, payload.default_password,
+            "Usuario Base %s" % user_group,
+            1, user_group, "N", "", "",
+        ] + [source[field] for field in USER_CLONE_FIELDS]
+        columns_sql = ", ".join("`%s`" % field for field in insert_columns)
+        placeholders = ", ".join(["%s"] * len(insert_columns))
+        cursor.execute("INSERT INTO vicidial_users (%s) VALUES (%s)" % (columns_sql, placeholders), values)
+
+    old_templates = load_group_templates()
+    old_defaults = load_group_defaults()
+    old_dynamic = load_dynamic_groups()
+    old_phone_templates = load_phone_template_groups()
+    try:
+        templates = dict(old_templates)
+        defaults = dict(old_defaults)
+        dynamic = dict(old_dynamic)
+        phone_templates = dict(old_phone_templates)
+        templates[user_group] = base_user
+        defaults[user_group] = payload.default_password
+        dynamic[user_group] = {
+            "start": extension_range["start"],
+            "end": extension_range["end"],
+            "allocation_start": extension_range["allocation_start"],
+            "reuse_free": False,
+            "allocation_policy": "SEQUENTIAL_NEW_ONLY",
+        }
+        phone_templates[user_group] = phone_template_group
+        _atomic_write_json(GROUP_TEMPLATES_FILE, templates, 0o640)
+        _atomic_write_json(GROUP_DEFAULTS_FILE, defaults, 0o600)
+        _atomic_write_json(DYNAMIC_GROUPS_FILE, dynamic, 0o640)
+        _atomic_write_json(PHONE_TEMPLATE_GROUPS_FILE, phone_templates, 0o640)
+    except Exception as exc:
+        try:
+            _atomic_write_json(GROUP_TEMPLATES_FILE, old_templates, 0o640)
+            _atomic_write_json(GROUP_DEFAULTS_FILE, old_defaults, 0o600)
+            _atomic_write_json(DYNAMIC_GROUPS_FILE, old_dynamic, 0o640)
+            _atomic_write_json(PHONE_TEMPLATE_GROUPS_FILE, old_phone_templates, 0o640)
+        except Exception:
+            pass
+        try:
+            with db_cursor() as cursor:
+                cursor.execute("DELETE FROM vicidial_users WHERE user=%s AND user_group=%s", (base_user, user_group))
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="GROUP_ADMIN_CONFIG_WRITE_FAILED:%s" % exc)
+
+    record_auth_event(
+        session["username"], "GROUP_ADMIN_SUCCESS", request,
+        "user_group=%s base_user=%s source_group=%s range=%s-%s" % (
+            user_group, base_user, source_group, extension_range["start"], extension_range["end"]
+        ),
+    )
+    return {
+        "status": "SUCCESS",
+        "user_group": user_group,
+        "base_user": base_user,
+        "source_group": source_group,
+        "phone_template_group": phone_template_group,
+        "extension_range": extension_range,
+        "default_password_configured": True,
+    }
 
 @app.get("/api/groups")
 def groups(request: Request):
