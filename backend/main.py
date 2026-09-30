@@ -135,7 +135,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.21.1-agent-phone-binding")
+app = FastAPI(title="Vici-Users API", version="0.22.0-homologation-ranges")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -520,12 +520,32 @@ def load_extension_ranges():
                 detail="Rango inválido para %s: %s-%s" % (group, start, end),
             )
         capacity = end - start + 1
-        if capacity > 50:
+        if capacity > 100:
             raise HTTPException(
                 status_code=503,
-                detail="Rango de %s excede el máximo de 50 extensiones" % group,
+                detail="Rango de %s excede el máximo de 100 extensiones" % group,
             )
-        clean[group] = {"start": start, "end": end, "capacity": capacity}
+        try:
+            allocation_start = int(value.get("allocation_start", start))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=503,
+                detail="allocation_start inválido para %s" % group,
+            )
+        if allocation_start < start or allocation_start > end:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "allocation_start fuera del rango para %s: %s"
+                    % (group, allocation_start)
+                ),
+            )
+        clean[group] = {
+            "start": start,
+            "end": end,
+            "capacity": capacity,
+            "allocation_start": allocation_start,
+        }
     return clean
 
 
@@ -1658,6 +1678,9 @@ def extension_candidate_pool(user_group):
     enabled_servers = set(
         node["server_ip"] for node in topology["nodes"] if node["enabled"]
     )
+    allocation_start = int(
+        extension_range.get("allocation_start", extension_range["start"])
+    )
     extensions = [
         str(value)
         for value in range(extension_range["start"], extension_range["end"] + 1)
@@ -1749,7 +1772,11 @@ def extension_candidate_pool(user_group):
                 })
             continue
 
-        if not rows and extension not in alias_ids:
+        if (
+            not rows
+            and extension not in alias_ids
+            and int(extension) >= allocation_start
+        ):
             uncreated_candidates.append({
                 "extension": extension,
                 "source": "UNCREATED",
