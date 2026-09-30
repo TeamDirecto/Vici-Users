@@ -84,6 +84,18 @@ CLUSTER_NODES_FILE = Path(
         str(APP_ROOT / "config" / "cluster_nodes.json"),
     )
 )
+DYNAMIC_GROUPS_FILE = Path(
+    os.getenv(
+        "VICI_USERS_DYNAMIC_GROUPS_FILE",
+        "/etc/vici-users/dynamic_groups.json",
+    )
+)
+PHONE_TEMPLATE_GROUPS_FILE = Path(
+    os.getenv(
+        "VICI_USERS_PHONE_TEMPLATE_GROUPS_FILE",
+        "/etc/vici-users/phone_template_groups.json",
+    )
+)
 USER_CLONE_FIELDS = [
     "delete_users", "delete_user_groups", "delete_lists", "delete_campaigns",
     "delete_ingroups", "delete_remote_agents", "load_leads", "campaign_detail",
@@ -135,7 +147,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.22.1-sequential-allocation")
+app = FastAPI(title="Vici-Users API", version="0.23.0-group-admin")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -461,26 +473,69 @@ def load_group_defaults():
     return clean
 
 
-def load_managed_groups():
-    # type: () -> List[str]
-    if not MANAGED_GROUPS_FILE.exists():
-        return []
+def load_dynamic_groups():
+    data = _load_json_mapping(DYNAMIC_GROUPS_FILE, "de grupos dinámicos")
+    clean = {}
+    for group, value in data.items():
+        group = str(group).strip()
+        if group and isinstance(value, dict):
+            clean[group] = dict(value)
+    return clean
+
+
+def load_phone_template_groups():
+    data = _load_json_mapping(
+        PHONE_TEMPLATE_GROUPS_FILE,
+        "de plantillas de phones por grupo",
+    )
+    clean = {}
+    for group, source_group in data.items():
+        group = str(group).strip()
+        source_group = str(source_group).strip()
+        if group and source_group:
+            clean[group] = source_group
+    return clean
+
+
+def _atomic_write_json(path, data, mode):
+    path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    tmp_path = path.with_name(".%s.%s.tmp" % (path.name, secrets.token_hex(6)))
     try:
-        with MANAGED_GROUPS_FILE.open("r") as fh:
-            data = json.load(fh)
-    except (ValueError, OSError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Configuración de grupos administrados inválida: %s" % exc,
-        )
-    if not isinstance(data, list):
-        raise HTTPException(
-            status_code=503,
-            detail="%s debe contener una lista JSON" % MANAGED_GROUPS_FILE.name,
-        )
+        with tmp_path.open("w") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.chmod(str(tmp_path), mode)
+        os.replace(str(tmp_path), str(path))
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def load_managed_groups():
+    base_groups = []
+    if MANAGED_GROUPS_FILE.exists():
+        try:
+            with MANAGED_GROUPS_FILE.open("r") as fh:
+                data = json.load(fh)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Configuración de grupos administrados inválida: %s" % exc,
+            )
+        if not isinstance(data, list):
+            raise HTTPException(
+                status_code=503,
+                detail="%s debe contener una lista JSON" % MANAGED_GROUPS_FILE.name,
+            )
+        base_groups = data
+
+    combined = list(base_groups) + list(load_dynamic_groups().keys())
     clean = []
     seen = set()
-    for group in data:
+    for group in combined:
         group = str(group).strip()
         if group and group not in seen:
             clean.append(group)
@@ -490,7 +545,10 @@ def load_managed_groups():
 
 def load_extension_ranges():
     # type: () -> Dict[str, Dict[str, int]]
-    data = _load_json_mapping(EXTENSION_RANGES_FILE, "de rangos de extensiones")
+    data = dict(
+        _load_json_mapping(EXTENSION_RANGES_FILE, "de rangos de extensiones")
+    )
+    data.update(load_dynamic_groups())
     clean = {}
     managed = set(load_managed_groups())
 
@@ -676,6 +734,10 @@ def phone_provisioning_dry_run(user_group, extension):
     alias_expected = expected_phone_alias(identity)
     range_start = str(extension_range["start"])
     range_end = str(extension_range["end"])
+    phone_template_group = load_phone_template_groups().get(
+        user_group,
+        user_group,
+    )
 
     enabled_nodes = [node for node in identity["nodes"] if node["enabled"]]
     all_logins = [node["login"] for node in identity["nodes"]]
@@ -752,7 +814,7 @@ def phone_provisioning_dry_run(user_group, extension):
                  LIMIT 1
                 """,
                 (
-                    user_group,
+                    phone_template_group,
                     node["server_ip"],
                     range_start,
                     range_end,
