@@ -90,6 +90,7 @@ DYNAMIC_GROUPS_FILE = Path(
         "/etc/vici-users/dynamic_groups.json",
     )
 )
+PHONE_TEMPLATE_GROUPS_BASE_FILE = APP_ROOT / "config" / "phone_template_groups.json"
 PHONE_TEMPLATE_GROUPS_FILE = Path(
     os.getenv(
         "VICI_USERS_PHONE_TEMPLATE_GROUPS_FILE",
@@ -484,9 +485,17 @@ def load_dynamic_groups():
 
 
 def load_phone_template_groups():
-    data = _load_json_mapping(
-        PHONE_TEMPLATE_GROUPS_FILE,
-        "de plantillas de phones por grupo",
+    data = dict(
+        _load_json_mapping(
+            PHONE_TEMPLATE_GROUPS_BASE_FILE,
+            "base de plantillas de phones por grupo",
+        )
+    )
+    data.update(
+        _load_json_mapping(
+            PHONE_TEMPLATE_GROUPS_FILE,
+            "de plantillas de phones por grupo",
+        )
     )
     clean = {}
     for group, source_group in data.items():
@@ -4128,7 +4137,7 @@ def _group_admin_plan(user_group, source_group, base_user=None):
             cursor.execute(
                 """
                 SELECT DISTINCT server_ip FROM phones
-                 WHERE user_group=%s
+                 WHERE user_group=%%s
                    AND active='Y'
                    AND status='ACTIVE'
                    AND template_id IS NOT NULL
