@@ -864,9 +864,12 @@
       if(!data.configured){$('templateWarning').textContent=`El grupo ${group} todavía no tiene usuario base configurado en vici97.`;$('templateWarning').classList.remove('hidden');return}
       const inventory=await api(`/groups/${encodeURIComponent(group)}/extensions/inventory`);const s=inventory.summary;
       const floor=(data.extension_range&&data.extension_range.allocation_start)||null;
+      const allocatableUncreated=(s.allocatable_uncreated!==undefined?s.allocatable_uncreated:s.uncreated);
+      const reservedPlan=(s.homologation_reserved_positions||0);
       $('extensionPoolStatus').textContent=
-        'Inventario: '+s.free+' reciclable(s) · '+s.uncreated+' sin crear · '+s.legacy+' legacy'+
-        (floor?' · siguiente alta nueva ≥ '+floor:'')+
+        'Inventario: '+s.free+' reciclable(s) · '+allocatableUncreated+' disponible(s) nueva(s) · '+s.legacy+' legacy'+
+        (reservedPlan?' · '+reservedPlan+' posición(es) reservada(s) por homologación':'')+
+        (floor?' · siguiente alta ≥ '+floor:'')+
         (s.group_mismatches?' · ⚠ '+s.group_mismatches+' desalineada(s)':'')+'.';
       selectedTemplate=data.template;$('tplUser').textContent=selectedTemplate.user;$('tplLevel').textContent=selectedTemplate.user_level;$('tplGroup').textContent=selectedTemplate.user_group;$('tplName').textContent=selectedTemplate.full_name||'—';$('previewBtn').disabled=false;
     }catch(error){$('templateWarning').textContent=error.message;$('templateWarning').classList.remove('hidden');toast(error.message)}
@@ -1285,7 +1288,8 @@
         const next=s.next_candidate?'<code>'+escapeHtml(s.next_candidate)+'</code> <span class="badge gray">'+escapeHtml(s.next_candidate_source||'')+'</span>':'—';
         const incomplete=s.topology_incomplete?'<span class="badge amber">'+s.topology_incomplete+'</span>':'<span class="badge green">0</span>';
         const rangeText=escapeHtml(r.start)+'–'+escapeHtml(r.end)+(r.allocation_start?' · altas ≥ '+escapeHtml(r.allocation_start):'');
-        return '<tr><td><strong>'+escapeHtml(row.user_group)+'</strong></td><td><code>'+rangeText+'</code></td><td>'+escapeHtml(s.legacy||0)+'</td><td>'+escapeHtml(s.free||0)+'</td><td>'+escapeHtml(s.uncreated||0)+'</td><td>'+incomplete+'</td><td>'+mismatch+'</td><td>'+next+'</td></tr>';
+        const availableNew=(s.allocatable_uncreated!==undefined?s.allocatable_uncreated:s.uncreated||0);
+        return '<tr><td><strong>'+escapeHtml(row.user_group)+'</strong></td><td><code>'+rangeText+'</code></td><td>'+escapeHtml(s.legacy||0)+'</td><td>'+escapeHtml(s.free||0)+'</td><td>'+escapeHtml(availableNew)+'</td><td>'+incomplete+'</td><td>'+mismatch+'</td><td>'+next+'</td></tr>';
       }).join('');
     }catch(error){$('auditRows').innerHTML='<tr><td colspan="8"><span class="badge red">Error</span> '+escapeHtml(error.message)+'</td></tr>';toast(error.message)}
   }
