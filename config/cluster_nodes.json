@@ -22,16 +22,16 @@
     },
     {
       "server_ip": "172.20.20.110",
-      "enabled": true,
+      "enabled": false,
       "login_suffix": "d",
-      "dialplan_prefix": "3"
+      "dialplan_prefix": "3",
+      "note": "Excluido de provisión/rebuild automático por directriz operativa; mantener desactivado hasta nueva indicación."
     },
     {
       "server_ip": "172.20.21.94",
-      "enabled": false,
+      "enabled": true,
       "login_suffix": "e",
-      "dialplan_prefix": "4",
-      "note": "Excluido temporalmente de provisión: las extensiones no registran correctamente en este nodo. Rehabilitar sólo después de validar SIP registration."
+      "dialplan_prefix": "4"
     }
   ]
 }
