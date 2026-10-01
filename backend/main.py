@@ -148,7 +148,7 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="Vici-Users API", version="0.23.0-group-admin")
+app = FastAPI(title="Vici-Users API", version="0.23.1-direct-sync-queue")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -2399,6 +2399,48 @@ def set_provisioning_operation_status(
         connection.close()
 
 
+def enqueue_asterisk_sync_job(
+    connection,
+    idempotency_key,
+    extension,
+    username,
+    required_servers,
+):
+    """Atomically queue post-write Asterisk sync in the caller's SQLite transaction."""
+    required = sorted(set(
+        str(server_ip).strip()
+        for server_ip in required_servers
+        if str(server_ip).strip()
+    ))
+    if not required:
+        raise RuntimeError("ASTERISK_SYNC_NO_REQUIRED_SERVERS")
+
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO asterisk_sync_jobs
+            (idempotency_key, extension, username,
+             required_servers_json, eligible_servers_json,
+             ineligible_servers_json, status, updated_at)
+        VALUES (?, ?, ?, ?, '[]', '[]', 'NEW', CURRENT_TIMESTAMP)
+        """,
+        (
+            str(idempotency_key),
+            str(extension),
+            str(username or ""),
+            json.dumps(required, sort_keys=True),
+        ),
+    )
+
+
+def enabled_asterisk_sync_servers():
+    topology = load_cluster_nodes()
+    return [
+        str(node["server_ip"])
+        for node in topology["nodes"]
+        if node["enabled"]
+    ]
+
+
 def finalize_inventory_in_use(payload, result):
     ensure_inventory_db()
     event_type = (
@@ -2461,6 +2503,13 @@ def finalize_inventory_in_use(payload, result):
                 json.dumps(result, sort_keys=True),
                 payload.idempotency_key,
             ),
+        )
+        enqueue_asterisk_sync_job(
+            connection,
+            payload.idempotency_key,
+            payload.extension,
+            payload.username.upper(),
+            enabled_asterisk_sync_servers(),
         )
         connection.commit()
     except Exception:
@@ -3333,6 +3382,33 @@ def ensure_inventory_db():
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_supervisor_operations_target "
                 "ON supervisor_operations(extension, username, status)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS asterisk_sync_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    extension TEXT NOT NULL,
+                    username TEXT,
+                    required_servers_json TEXT NOT NULL,
+                    eligible_servers_json TEXT NOT NULL DEFAULT '[]',
+                    ineligible_servers_json TEXT NOT NULL DEFAULT '[]',
+                    manager_ids_json TEXT,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    rebuild_requested_at TEXT,
+                    settle_started_at TEXT,
+                    reload_queued_at TEXT,
+                    completed_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_asterisk_sync_jobs_status "
+                "ON asterisk_sync_jobs(status)"
             )
             connection.execute(
                 """
@@ -5090,6 +5166,13 @@ def finalize_group_change_inventory(payload, preview, result):
                 payload.idempotency_key,
             ),
         )
+        enqueue_asterisk_sync_job(
+            connection,
+            "GC:" + payload.idempotency_key,
+            payload.target_extension.strip(),
+            username,
+            enabled_asterisk_sync_servers(),
+        )
         connection.commit()
     except Exception:
         connection.rollback()
@@ -6275,6 +6358,14 @@ def set_supervisor_operation(idempotency_key, status, result=None, error_text=No
                 idempotency_key,
             ),
         )
+        if status == "SUCCESS" and result:
+            enqueue_asterisk_sync_job(
+                connection,
+                "SUP:" + str(idempotency_key),
+                result.get("extension"),
+                result.get("username"),
+                [result.get("server_ip")],
+            )
         connection.commit()
     finally:
         connection.close()
