@@ -1466,6 +1466,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
             "status",
             "active",
             "fullname",
+            "outbound_cid",
             "messages",
             "old_messages",
             "login_user",
@@ -1533,6 +1534,13 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                 else source_fullname
             )
 
+            source_outbound_cid = str(source_row.get("outbound_cid") or "")
+            target_outbound_cid = (
+                source_outbound_cid.replace(source_extension_text, extension_text)
+                if source_extension_text and source_extension_text in source_outbound_cid
+                else source_outbound_cid
+            )
+
             override_values = {
                 "extension": extension_text,
                 "dialplan_number": target["dialplan_number"],
@@ -1545,6 +1553,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                 "status": "ACTIVE",
                 "active": "N",
                 "fullname": target_fullname,
+                "outbound_cid": target_outbound_cid,
                 "messages": 0,
                 "old_messages": 0,
                 "login_user": None,
@@ -1602,6 +1611,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                     {"field": "status", "from": str(source_row.get("status") or ""), "to": "ACTIVE"},
                     {"field": "active", "from": str(source_row.get("active") or ""), "to": "N"},
                     {"field": "fullname", "from": source_fullname, "to": target_fullname},
+                    {"field": "outbound_cid", "from": source_outbound_cid, "to": target_outbound_cid},
                     {"field": "messages", "from": "<SOURCE_VALUE>", "to": 0},
                     {"field": "old_messages", "from": "<SOURCE_VALUE>", "to": 0},
                     {"field": "login_user", "from": "<SOURCE_VALUE>", "to": None},
@@ -5240,19 +5250,6 @@ def group_change_target_write_plan(preview, payload):
         payload.username.strip().upper(),
         preview["full_name"],
         payload.target_extension.strip(),
-    )
-
-    print(
-        "GROUP_CHANGE_PLAN_DEBUG user=%s group=%s extension=%s status=%s blockers=%r warnings=%r"
-        % (
-            payload.username.strip().upper(),
-            payload.target_user_group.strip(),
-            payload.target_extension.strip(),
-            plan.get("status"),
-            plan.get("blockers"),
-            plan.get("warnings"),
-        ),
-        flush=True,
     )
 
     blockers = [
