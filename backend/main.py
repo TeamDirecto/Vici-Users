@@ -5241,6 +5241,20 @@ def group_change_target_write_plan(preview, payload):
         preview["full_name"],
         payload.target_extension.strip(),
     )
+
+    print(
+        "GROUP_CHANGE_PLAN_DEBUG user=%s group=%s extension=%s status=%s blockers=%r warnings=%r"
+        % (
+            payload.username.strip().upper(),
+            payload.target_user_group.strip(),
+            payload.target_extension.strip(),
+            plan.get("status"),
+            plan.get("blockers"),
+            plan.get("warnings"),
+        ),
+        flush=True,
+    )
+
     blockers = [
         blocker for blocker in plan.get("blockers", [])
         if blocker != "TARGET_USER_ALREADY_EXISTS"
