@@ -1528,11 +1528,7 @@ def provisioning_write_plan(user_group, username, full_name, extension):
                     )
 
             source_fullname = str(source_row.get("fullname") or "")
-            target_fullname = (
-                source_fullname.replace(source_extension_text, extension_text)
-                if source_extension_text and source_extension_text in source_fullname
-                else source_fullname
-            )
+            target_fullname = "ext %s" % extension_text
 
             source_outbound_cid = str(source_row.get("outbound_cid") or "")
             target_outbound_cid = (
